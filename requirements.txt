@@ -1,0 +1,11 @@
+langchain
+langchain-chroma
+langchain-community
+langchain-openai
+langchain-text-splitters
+chromadb
+sentence-transformers
+openai
+tiktoken
+torch
+tqdm
