@@ -7,7 +7,6 @@ try:
     import torch
     from langchain_community.embeddings import HuggingFaceEmbeddings
     from langchain_core.embeddings import Embeddings
-    from langchain_openai import OpenAIEmbeddings
 except ImportError as e:
     raise SystemExit(
         "필수 패키지가 없습니다. 아래를 설치한 뒤 다시 실행하세요.\n"
@@ -61,12 +60,21 @@ def max_cuda_vram_usage_mb() -> float:
     return max(snapshot_cuda_allocated_mb(), snapshot_cuda_peak_mb())
 
 
+def _needs_trust_remote_code(model_id: str) -> bool:
+    mid = model_id.lower()
+    return any(
+        token in mid
+        for token in ("bge-m3", "jina-embeddings", "gte-multilingual", "alibaba-nlp")
+    )
+
+
 def build_local_embeddings(model_id: str, use_e5_prefix: bool) -> tuple[Embeddings, Callable[[], None]]:
+    # VRAM·처리량: CUDA 사용 시 GPU 고정, 배치 16 기본(OOM 시 EMBED_BATCH_SIZE로 하향)
     model_kwargs: dict[str, Any] = {"device": "cuda" if cuda_available() else "cpu"}
-    if "bge-m3" in model_id.lower():
+    if _needs_trust_remote_code(model_id):
         model_kwargs["trust_remote_code"] = True
 
-    encode_kwargs = {
+    encode_kwargs: dict[str, Any] = {
         "normalize_embeddings": True,
         "batch_size": int(os.environ.get("EMBED_BATCH_SIZE", "16")),
     }
@@ -87,12 +95,6 @@ def build_local_embeddings(model_id: str, use_e5_prefix: bool) -> tuple[Embeddin
             torch.cuda.empty_cache()
 
     return emb, cleanup
-
-
-def build_openai_embeddings(model_id: str) -> Embeddings | None:
-    if not os.environ.get("OPENAI_API_KEY"):
-        return None
-    return OpenAIEmbeddings(model=model_id)
 
 
 def detect_hardware_note() -> str:

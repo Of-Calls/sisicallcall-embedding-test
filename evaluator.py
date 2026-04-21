@@ -3,14 +3,16 @@ from __future__ import annotations
 import math
 import os
 import shutil
+import sys
 import tempfile
 import time
 import uuid
+from pathlib import Path
 from typing import Callable
 
 try:
-    import tiktoken
     from langchain_chroma import Chroma
+    from langchain_community.document_loaders import PyPDFDirectoryLoader
     from langchain_core.documents import Document
     from langchain_core.embeddings import Embeddings
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -21,33 +23,63 @@ except ImportError as e:
         "  pip install -r requirements.txt"
     ) from e
 
-from config import (
-    CHROMA_COSINE_CONFIG,
-    CHUNK_OVERLAP,
-    OPENAI_EMBEDDING_PRICE_PER_1M_USD,
-    CaseMetrics,
-    ModelSpec,
-)
-from providers import (
-    build_local_embeddings,
-    build_openai_embeddings,
-    cuda_available,
-    max_cuda_vram_usage_mb,
-    reset_cuda_stats,
-)
+from config import CHROMA_COSINE_CONFIG, CHUNK_OVERLAP, CaseMetrics, ModelSpec
+from providers import build_local_embeddings, cuda_available, max_cuda_vram_usage_mb, reset_cuda_stats
+
+SANITY_PREVIEW_MAX_CHARS = 150
 
 
-def load_manual(path) -> str:
-    """벤치마크 입력은 프로젝트의 `data/manual.txt`를 사용합니다."""
-    if not path.is_file():
+def _compact_preview(text: str, limit: int = SANITY_PREVIEW_MAX_CHARS) -> str:
+    one_line = " ".join(str(text).split())
+    return (one_line[:limit] if len(one_line) > limit else one_line) + "..."
+
+
+def _chunk_label(row: dict[str, float | int | str]) -> str:
+    idx = int(row.get("chunk_index", -1))
+    return f"chunk_{idx:03d}" if idx >= 0 else "chunk_---"
+
+
+def print_retrieval_sanity_block(
+    *,
+    model_label: str,
+    chunk_size: int,
+    question: str,
+    rows: list[dict[str, float | int | str]],
+) -> None:
+    if not rows:
+        return
+    header = f"========== [모델명: {model_label} | Chunk: {chunk_size}] =========="
+    lines = [f"\n{header}", f"질문: {question}", "", "Top-3 검색 결과"]
+    for i, row in enumerate(rows[:3], start=1):
+        sim = float(row["cosine_similarity"])
+        chunk = _chunk_label(row)
+        preview = _compact_preview(str(row["text"]))
+        lines.append(f"{i}) {chunk} | sim={sim:.3f}")
+        lines.append(f" \"{preview}\"")
+        if i < min(3, len(rows)):
+            lines.append("")
+    lines.append("=" * len(header))
+    tqdm.write("\n".join(lines), file=sys.stderr)
+
+
+def load_pdf_corpus(directory: Path) -> str:
+    """`docs/` 등 디렉터리 내 모든 PDF를 읽어 페이지 텍스트를 하나로 병합합니다."""
+    if not directory.is_dir():
         raise FileNotFoundError(
-            f"매뉴얼 파일이 없습니다: {path}\n"
-            f"`data/manual.txt`(비전클라우드 고객센터 매뉴얼 등)를 두고 다시 실행하세요."
+            f"PDF 디렉터리가 없습니다: {directory}\n"
+            f"프로젝트 루트에 `{directory.name}` 폴더를 만들고 PDF를 넣은 뒤 다시 실행하세요."
         )
-    text = path.read_text(encoding="utf-8")
-    if not text.strip():
-        raise ValueError(f"매뉴얼 파일이 비어 있습니다: {path}")
-    return text
+    loader = PyPDFDirectoryLoader(str(directory), glob="**/*.pdf")
+    raw_docs = loader.load()
+    if not raw_docs:
+        raise ValueError(
+            f"PDF가 없거나 로드 결과가 비었습니다: {directory}\n"
+            f"`**/*.pdf` 패턴에 맞는 파일을 추가하세요."
+        )
+    parts = [d.page_content.strip() for d in raw_docs if d.page_content and str(d.page_content).strip()]
+    if not parts:
+        raise ValueError(f"PDF에서 추출된 텍스트가 없습니다(스캔 PDF 등): {directory}")
+    return "\n\n".join(parts)
 
 
 def split_documents(text: str, chunk_size: int, overlap: int = CHUNK_OVERLAP) -> list[Document]:
@@ -67,18 +99,6 @@ def split_documents(text: str, chunk_size: int, overlap: int = CHUNK_OVERLAP) ->
 def chroma_similarity_from_distance(distance: float) -> float:
     """Chroma cosine space: distance = 1 - cos_sim → cos_sim = 1 - distance."""
     return max(0.0, min(1.0, 1.0 - distance))
-
-
-def doc_matches_keywords(doc_text: str, keywords: list[str]) -> bool:
-    return any(k in doc_text for k in keywords)
-
-
-def count_tokens_openai(text: str) -> int:
-    try:
-        enc = tiktoken.get_encoding("cl100k_base")
-    except Exception:
-        enc = tiktoken.encoding_for_model("gpt-4")
-    return len(enc.encode(text))
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -114,7 +134,7 @@ def run_single_case(
     full_text: str,
     spec: ModelSpec,
     chunk_size: int,
-    queries: list[tuple[str, str, list[str]]],
+    queries: list[tuple[str, str]],
     retrieval_warmup: int = 1,
     retrieval_repeats: int = 5,
     embedder: Embeddings | None = None,
@@ -130,17 +150,12 @@ def run_single_case(
     cleanup: Callable[[], None] = lambda: None
 
     if embedder is None:
-        if spec.kind == "local":
-            t0 = time.perf_counter()
-            embedder, cleanup = build_local_embeddings(spec.model_id, spec.use_e5_prefix)
-            load_time = time.perf_counter() - t0
-            if cuda_available():
-                vram_max = max(vram_max, max_cuda_vram_usage_mb())
-        else:
-            embedder = build_openai_embeddings(spec.model_id)
-            if embedder is None:
-                raise RuntimeError("OPENAI_API_KEY 가 설정되지 않았습니다.")
-    elif spec.kind == "local" and cuda_available():
+        t0 = time.perf_counter()
+        embedder, cleanup = build_local_embeddings(spec.model_id, spec.use_e5_prefix)
+        load_time = time.perf_counter() - t0
+        if cuda_available():
+            vram_max = max(vram_max, max_cuda_vram_usage_mb())
+    elif cuda_available():
         vram_max = max(vram_max, max_cuda_vram_usage_mb())
 
     persist_dir = tempfile.mkdtemp(prefix="chroma_bench_")
@@ -154,7 +169,7 @@ def run_single_case(
             collection_configuration=CHROMA_COSINE_CONFIG,
         )
         index_time = time.perf_counter() - index_t0
-        if cuda_available() and spec.kind == "local":
+        if cuda_available():
             vram_max = max(vram_max, max_cuda_vram_usage_mb())
 
         timings: list[float] = []
@@ -163,11 +178,11 @@ def run_single_case(
         total_inner = len(queries) * (retrieval_warmup + retrieval_repeats)
         with tqdm(total=total_inner, desc=f"{spec.label} cs={chunk_size} retrieval", leave=False) as pbar:
             for _warm_idx in range(retrieval_warmup):
-                for _qkey, qtext, _kws in queries:
+                for _qkey, qtext in queries:
                     vs.similarity_search_with_score(qtext, k=3)
                     pbar.update(1)
             for repeat_idx in range(retrieval_repeats):
-                for qkey, qtext, _kws in queries:
+                for qkey, qtext in queries:
                     tq = time.perf_counter()
                     scored = vs.similarity_search_with_score(qtext, k=3)
                     timings.append(time.perf_counter() - tq)
@@ -180,45 +195,27 @@ def run_single_case(
                                     "chroma_distance": dist,
                                     "cosine_similarity": chroma_similarity_from_distance(dist),
                                     "text": doc.page_content,
+                                    "chunk_index": doc.metadata.get("chunk_index", -1),
                                 }
                             )
                         query_results_raw[qkey] = rows
+                        if rows and repeat_idx == retrieval_repeats - 1:
+                            print_retrieval_sanity_block(
+                                model_label=spec.label,
+                                chunk_size=chunk_size,
+                                question=qtext,
+                                rows=rows,
+                            )
                     pbar.update(1)
 
         retrieval_avg = sum(timings) / len(timings) if timings else 0.0
         retrieval_p95 = percentile(timings, 95)
 
-        if cuda_available() and spec.kind == "local":
+        if cuda_available():
             vram_max = max(vram_max, max_cuda_vram_usage_mb())
-
-        # 품질 지표 (최종 반복 Top-3 기준)
-        hit_count = 0
-        reciprocal_ranks: list[float] = []
-        for qkey, _, kws in queries:
-            rows = query_results_raw.get(qkey, [])
-            rr = 0.0
-            for row in rows:
-                if doc_matches_keywords(str(row["text"]), kws):
-                    rr = 1.0 / int(row["rank"])
-                    break
-            if rr > 0:
-                hit_count += 1
-            reciprocal_ranks.append(rr)
-        denom = len(queries) if queries else 1
-        hit_at_3 = hit_count / denom
-        mrr_at_3 = sum(reciprocal_ranks) / denom
 
         index_size_mb = directory_size_mb(persist_dir)
         embedding_docs_per_sec = (len(documents) / index_time) if index_time > 0 else 0.0
-
-        token_count: int | None = None
-        cost_str: str
-        if spec.kind == "openai":
-            token_count = count_tokens_openai(full_text)
-            cost = (token_count / 1_000_000.0) * OPENAI_EMBEDDING_PRICE_PER_1M_USD
-            cost_str = f"${cost:.6f} (cl100k_base 추정)"
-        else:
-            cost_str = "$0 (단, 하드웨어 고정비 발생)"
 
         return CaseMetrics(
             model_label=spec.label,
@@ -228,13 +225,9 @@ def run_single_case(
             index_time_sec=index_time,
             retrieval_avg_sec=retrieval_avg,
             retrieval_p95_sec=retrieval_p95,
-            vram_peak_mb=vram_max if cuda_available() and spec.kind == "local" else None,
+            vram_peak_mb=vram_max if cuda_available() else None,
             index_size_mb=index_size_mb,
             embedding_docs_per_sec=embedding_docs_per_sec,
-            hit_at_3=hit_at_3,
-            mrr_at_3=mrr_at_3,
-            token_count=token_count,
-            estimated_cost_usd=cost_str,
             query_results=query_results_raw,  # type: ignore[arg-type]
         )
     finally:
@@ -247,7 +240,7 @@ def run_case_safe(
     full_text: str,
     spec: ModelSpec,
     chunk_size: int,
-    queries: list[tuple[str, str, list[str]]],
+    queries: list[tuple[str, str]],
     embedder: Embeddings | None = None,
     load_time_override: float | None = None,
     owns_embedder: bool = True,

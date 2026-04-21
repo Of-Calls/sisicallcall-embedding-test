@@ -29,3 +29,9 @@ benchmark_visualization.png
 
 # Ad-hoc documentation notes
 docs/
+# Added by code-review-graph
+.code-review-graph/
+
+.claude/
+.cursor/
+.cursorrules
