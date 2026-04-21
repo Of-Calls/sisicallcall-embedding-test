@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
-import tempfile
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -39,10 +40,68 @@ class RuntimeStore:
         self.pdf_dir = Path(pdf_dir)
         self.max_models_in_cache = max(1, max_models_in_cache)
         self.full_text = load_pdf_corpus(self.pdf_dir)
+        self.persist_root = self.pdf_dir / "chroma_db"
+        self.persist_root.mkdir(parents=True, exist_ok=True)
+        self.pdf_signature = self._compute_pdf_signature()
         self.docs_cache: dict[int, list[Any]] = {}
         self.model_cache: OrderedDict[str, LoadedModel] = OrderedDict()
         self.vector_cache: dict[tuple[str, int], VectorStoreEntry] = {}
         self.hardware_note = detect_hardware_note()
+
+    def _compute_pdf_signature(self) -> str:
+        h = hashlib.sha256()
+        pdfs = sorted(self.pdf_dir.glob("**/*.pdf"))
+        for p in pdfs:
+            st = p.stat()
+            rel = p.relative_to(self.pdf_dir).as_posix()
+            h.update(rel.encode("utf-8"))
+            h.update(str(st.st_size).encode("utf-8"))
+            h.update(str(int(st.st_mtime)).encode("utf-8"))
+        return h.hexdigest()
+
+    def _model_slug(self, model_id: str) -> str:
+        return model_id.replace("/", "__")
+
+    def _db_dir(self, model_id: str, chunk_size: int) -> Path:
+        return self.persist_root / self._model_slug(model_id) / f"chunk_{chunk_size}"
+
+    def _meta_path(self, model_id: str, chunk_size: int) -> Path:
+        return self._db_dir(model_id, chunk_size) / "meta.json"
+
+    def _collection_name(self, model_id: str, chunk_size: int) -> str:
+        # collection 명에 모델명이 들어가도록 고정 규칙 사용
+        return f"bench_{self._model_slug(model_id)}_{chunk_size}"
+
+    def collection_name(self, model_id: str, chunk_size: int) -> str:
+        return self._collection_name(model_id, chunk_size)
+
+    def db_path(self, model_id: str, chunk_size: int) -> Path:
+        return self._db_dir(model_id, chunk_size)
+
+    def _meta_matches(self, model_id: str, chunk_size: int) -> bool:
+        mp = self._meta_path(model_id, chunk_size)
+        if not mp.is_file():
+            return False
+        try:
+            meta = json.loads(mp.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        return (
+            meta.get("model_id") == model_id
+            and int(meta.get("chunk_size", -1)) == chunk_size
+            and meta.get("pdf_signature") == self.pdf_signature
+        )
+
+    def _write_meta(self, model_id: str, chunk_size: int) -> None:
+        mp = self._meta_path(model_id, chunk_size)
+        mp.parent.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "model_id": model_id,
+            "chunk_size": chunk_size,
+            "pdf_signature": self.pdf_signature,
+            "updated_at": int(time.time()),
+        }
+        mp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _touch_model(self, model_id: str) -> None:
         if model_id in self.model_cache:
@@ -57,8 +116,7 @@ class RuntimeStore:
                 pass
             keys = [k for k in self.vector_cache if k[0] == old_model_id]
             for k in keys:
-                entry = self.vector_cache.pop(k)
-                shutil.rmtree(entry.persist_dir, ignore_errors=True)
+                self.vector_cache.pop(k)
 
     def get_or_load_model(self, spec: ModelSpec) -> tuple[LoadedModel | None, float, str | None]:
         if spec.model_id in self.model_cache:
@@ -95,20 +153,33 @@ class RuntimeStore:
                 self.docs_cache[chunk_size] = docs
 
             t0 = time.perf_counter()
-            persist_dir = tempfile.mkdtemp(prefix=f"vs_{spec.model_id.replace('/', '_')}_{chunk_size}_")
-            vs = Chroma.from_documents(
-                documents=docs,
-                embedding=loaded.embedder,
-                collection_name=f"bench_{spec.model_id.replace('/', '_')}_{chunk_size}",
-                persist_directory=persist_dir,
-                collection_configuration=CHROMA_COSINE_CONFIG,
-            )
+            db_dir = self._db_dir(spec.model_id, chunk_size)
+            db_dir.mkdir(parents=True, exist_ok=True)
+
+            if self._meta_matches(spec.model_id, chunk_size):
+                vs = Chroma(
+                    collection_name=self._collection_name(spec.model_id, chunk_size),
+                    embedding_function=loaded.embedder,
+                    persist_directory=str(db_dir),
+                    collection_configuration=CHROMA_COSINE_CONFIG,
+                )
+            else:
+                shutil.rmtree(db_dir, ignore_errors=True)
+                db_dir.mkdir(parents=True, exist_ok=True)
+                vs = Chroma.from_documents(
+                    documents=docs,
+                    embedding=loaded.embedder,
+                    collection_name=self._collection_name(spec.model_id, chunk_size),
+                    persist_directory=str(db_dir),
+                    collection_configuration=CHROMA_COSINE_CONFIG,
+                )
+                self._write_meta(spec.model_id, chunk_size)
             sec = time.perf_counter() - t0
             entry = VectorStoreEntry(
                 model_id=spec.model_id,
                 chunk_size=chunk_size,
                 vectorstore=vs,
-                persist_dir=persist_dir,
+                persist_dir=str(db_dir),
                 build_time_sec=sec,
                 docs_count=len(docs),
             )
@@ -190,7 +261,12 @@ class RuntimeStore:
             "vectorstores": [
                 {"model_id": k[0], "chunk_size": k[1]} for k in sorted(self.vector_cache.keys())
             ],
+            "persist_root": str(self.persist_root),
         }
+
+    def ensure_built(self, spec: ModelSpec, chunk_size: int) -> tuple[bool, str | None]:
+        entry, _sec, err = self.get_or_build_vectorstore(spec, chunk_size)
+        return (entry is not None), err
 
     def close(self) -> None:
         for loaded in self.model_cache.values():
@@ -198,7 +274,5 @@ class RuntimeStore:
                 loaded.cleanup()
             except Exception:
                 pass
-        for entry in self.vector_cache.values():
-            shutil.rmtree(entry.persist_dir, ignore_errors=True)
         self.model_cache.clear()
         self.vector_cache.clear()

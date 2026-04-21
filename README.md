@@ -6,6 +6,7 @@
 
 - `main.py`: 벤치마크 실행 진입점
 - `server.py`: `uvicorn + FastAPI` 서버 모드
+- `build_chromaDB.py`: 모델/청크별 ChromaDB 사전 빌드
 - `runtime_store.py`: on-demand 모델 로드 + LRU 캐시 + vectorstore 캐시
 - `config.py`: 모델/청크/쿼리 등 전역 설정
 - `providers.py`: 임베딩 모델 로딩/언로딩
@@ -54,6 +55,23 @@ python main.py
 ```bash
 uvicorn server:app --host 0.0.0.0 --port 8000
 ```
+
+### 3) ChromaDB 사전 빌드 (권장)
+
+```bash
+python build_chromaDB.py
+```
+
+옵션:
+
+```bash
+python build_chromaDB.py --rebuild
+python build_chromaDB.py --models BAAI/bge-m3 intfloat/multilingual-e5-base --chunk-sizes 600 1000
+```
+
+저장 위치:
+- `data/chroma_db/<model_slug>/chunk_<size>/`
+- 컬렉션명: `bench_<model_slug>_<size>` (모델명 포함)
 
 - `GET /health`: 하드웨어/캐시 상태
 - `GET /models`: 모델 목록 + chunk size + 현재 캐시 상태
