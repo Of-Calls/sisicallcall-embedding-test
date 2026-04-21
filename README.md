@@ -1,17 +1,17 @@
 # bge_test
 
-`data/manual.txt`를 입력으로 사용해 로컬 임베딩 모델과 OpenAI 임베딩을 비교 벤치마크하고, 결과를 실행 시각 폴더(`reports/YYYYMMDD_HHMMSS/`)에 생성하는 프로젝트입니다.
+`data/` 폴더의 PDF 코퍼스를 대상으로 로컬 임베딩 모델을 비교하는 벤치마크/질의 서버입니다.
 
 ## 포함 파일
 
 - `main.py`: 벤치마크 실행 진입점
+- `server.py`: `uvicorn + FastAPI` 서버 모드
+- `runtime_store.py`: on-demand 모델 로드 + LRU 캐시 + vectorstore 캐시
 - `config.py`: 모델/청크/쿼리 등 전역 설정
-- `providers.py`: 임베딩 Provider 로딩 로직
-- `evaluator.py`: 인덱싱/검색/VRAM 측정 로직
-- `reporter.py`: 마크다운 리포트/시각화 확장 포인트
-- `data/manual.txt`: 벤치마크 입력 문서
-- `reports/`: 실행 결과 리포트/차트 보관 폴더(자동 생성)
-- `.env.example`: 환경변수 템플릿
+- `providers.py`: 임베딩 모델 로딩/언로딩
+- `evaluator.py`: PDF 로드/청킹/유사도 유틸
+- `reporter.py`: 마크다운 리포트 생성
+- `reports/`: 실행 결과 리포트 보관 폴더(자동 생성)
 
 ## 사전 요구사항
 
@@ -34,49 +34,56 @@ pip install -r requirements.txt
 
 ## 환경변수 설정
 
-`.env.example`를 참고해 키를 준비합니다.
-
-```env
-OPENAI_API_KEY=
-```
-
-이 스크립트는 실행 시 프로젝트 루트의 `.env` 파일을 자동으로 읽습니다.
-셸 환경변수로 직접 설정해도 되며, 이미 설정된 값이 있으면 해당 값을 우선 사용합니다.
-
-cmd 예시:
-
-```bat
-set OPENAI_API_KEY=sk-...
-```
+- `EMBED_BATCH_SIZE` (기본 `8`): 임베딩 배치 크기
+- `MODEL_CACHE_SIZE` (기본 `1`): 서버 모델 LRU 캐시 크기
+- `FORCE_CPU_MODELS` (선택): CPU 강제 모델 ID comma-separated
+  - 예: `set FORCE_CPU_MODELS=Alibaba-NLP/gte-multilingual-base`
 
 ## 실행 방법
 
-프로젝트 루트에서 실행:
+### 1) CLI 벤치마크
 
 ```bash
 python main.py
 ```
 
-## 동작 개요
+실행 후 `reports/YYYYMMDD_HHMMSS/embedding_benchmark_report.md` 생성.
 
-- 입력: `data/manual.txt`
-- 비교 모델
-  - Local 기준 BGE-M3 (`BAAI/bge-m3`)
-  - Local E5-large (`intfloat/multilingual-e5-large`)
-  - Local 경량 Ko-SBERT (`jhgan/ko-sroberta-multitask`)
-  - API OpenAI small (`text-embedding-3-small`)
-- Chunk size: `300`, `600`, `1000` (overlap `50`)
-- 지표: 로드 시간, 인덱싱 시간, 평균 검색 시간, VRAM 피크, 검색 품질(Top-3), 추정 비용
+### 2) 서버 모드 (`uvicorn + FastAPI`)
 
-## 결과 파일
+```bash
+uvicorn server:app --host 0.0.0.0 --port 8000
+```
 
-실행이 완료되면 아래 폴더가 새로 생성됩니다.
+- `GET /health`: 하드웨어/캐시 상태
+- `GET /models`: 모델 목록 + chunk size + 현재 캐시 상태
+- `POST /query`: 단일 모델/청크 질의
+- `POST /query_all`: 전체 모델 순차 질의
 
-- `reports/YYYYMMDD_HHMMSS/embedding_benchmark_report.md`
-- `reports/YYYYMMDD_HHMMSS/benchmark_visualization.png`
+`curl` 예시(Windows):
 
-## 참고 사항
+```bat
+curl -X POST "http://127.0.0.1:8000/query" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"model_id\":\"BAAI/bge-m3\",\"chunk_size\":600,\"question\":\"키 카드를 들고 멀어지면 자동으로 잠기나?\",\"k\":3}"
+```
 
-- `OPENAI_API_KEY`가 없으면 OpenAI 케이스는 자동으로 건너뜁니다.
-- `.gitignore`에 `.env`, `venv/`, `__pycache__/`, `*.pyc`가 제외되어 있습니다.
-- 기존 루트 산출물(`embedding_benchmark_report.md`, `benchmark_visualization.png`)이 있으면 최초 실행 시 `reports/_legacy/`로 자동 이동되어 보존됩니다.
+전체 모델 순차 질의:
+
+```bat
+curl -X POST "http://127.0.0.1:8000/query_all" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"question\":\"키 카드를 들고 멀어지면 자동으로 잠기나?\",\"chunk_size\":600,\"k\":3}"
+```
+
+터미널 입력형 테스트:
+
+```bash
+python interactive_query.py
+```
+
+## 동작 특성
+
+- 모델 전부 선로드 대신 **on-demand 로드 + LRU 캐시**(기본 1개)로 VRAM 안정성 확보
+- 같은 `(model_id, chunk_size)` 반복 질의는 vectorstore를 재사용하여 PDF 재로딩/재청킹/재인덱싱 최소화
+- 실패 케이스도 누락하지 않고 리포트와 API 응답에 `status=failed`, `error_message` 기록

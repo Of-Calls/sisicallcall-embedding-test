@@ -44,6 +44,9 @@ class CaseMetrics:
     vram_peak_mb: float | None
     index_size_mb: float
     embedding_docs_per_sec: float
+    status: str = "ok"
+    error_type: str | None = None
+    error_message: str | None = None
     query_results: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 

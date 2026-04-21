@@ -9,6 +9,7 @@ sisicallcall — 임베딩 모델 RAG/Semantic Cache 벤치마크
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import sys
 import time
@@ -16,9 +17,9 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from config import CHUNK_SIZES, DOCS_PDF_DIR, MODELS_TO_TEST, REPORTS_ROOT, TEST_QUERIES
-from evaluator import load_pdf_corpus, run_case_safe
-from providers import build_local_embeddings, detect_hardware_note
+from config import CHUNK_SIZES, DOCS_PDF_DIR, MODELS_TO_TEST, REPORTS_ROOT, TEST_QUERIES, CaseMetrics
+from evaluator import print_retrieval_sanity_block
+from runtime_store import RuntimeStore
 from reporter import create_report_output_dir, format_load_time, format_vram, write_report
 
 
@@ -83,70 +84,91 @@ def main() -> None:
     print(" sisicallcall — Embedding + Chroma 벤치마크")
     print("=" * 60)
 
-    hw = detect_hardware_note()
-    log.info("환경: %s", hw)
     migrate_legacy_report_if_exists()
-
-    try:
-        full_text = load_pdf_corpus(DOCS_PDF_DIR)
-    except (FileNotFoundError, ValueError) as e:
-        log.error("%s", e)
-        sys.exit(1)
-
-    log.info("입력 PDF 코퍼스: %s (%d chars)", DOCS_PDF_DIR.resolve(), len(full_text))
 
     all_metrics = []
     t_start = time.perf_counter()
-
-    # 요청 반영: 모델을 먼저 전부 로드한 뒤 테스트를 수행
-    loaded_models: dict[str, tuple[object, float, object, object]] = {}
-    # value: (embedder, load_time_sec, cleanup_fn, spec)
-    for spec in MODELS_TO_TEST:
-        t0 = time.perf_counter()
-        try:
-            emb, cleanup = build_local_embeddings(spec.model_id, spec.use_e5_prefix)
-            load_sec = time.perf_counter() - t0
-            loaded_models[spec.model_id] = (emb, load_sec, cleanup, spec)
-            log.info("[선로드 완료] %s: %.2fs", spec.label, load_sec)
-        except Exception as e:
-            log.error("[선로드 실패] %s: %s", spec.label, e)
-
-    if not loaded_models:
-        log.error("로드 가능한 모델이 없습니다. 실행을 종료합니다.")
+    max_cache = int(os.environ.get("MODEL_CACHE_SIZE", "1"))
+    try:
+        store = RuntimeStore(pdf_dir=DOCS_PDF_DIR, max_models_in_cache=max_cache)
+    except Exception as e:
+        log.error("런타임 초기화 실패: %s", e)
         sys.exit(1)
+
+    hw = store.hardware_note
+    log.info("환경: %s", hw)
+    log.info("모델 캐시 정책: LRU 최대 %s개", max_cache)
 
     total_cases = len(MODELS_TO_TEST) * len(CHUNK_SIZES)
     outer = tqdm(total=total_cases, desc="전체 케이스", unit="case")
 
     try:
         for spec in MODELS_TO_TEST:
-            loaded = loaded_models.get(spec.model_id)
-            if loaded is None:
-                for _ in CHUNK_SIZES:
-                    outer.update(1)
-                continue
-            shared_embedder, shared_load_time, _cleanup, _loaded_spec = loaded
-            first_chunk = True
-
             for chunk_size in CHUNK_SIZES:
                 outer.set_postfix(model=spec.label[:24], chunk=chunk_size)
-                metric, err = run_case_safe(
-                    full_text,
-                    spec,
-                    chunk_size,
-                    TEST_QUERIES,
-                    embedder=shared_embedder,  # type: ignore[arg-type]
-                    load_time_override=shared_load_time if first_chunk else 0.0,  # type: ignore[arg-type]
-                    owns_embedder=False,
+                load_time = None
+                index_time = 0.0
+                timings: list[float] = []
+                query_results: dict[str, list[dict[str, object]]] = {}
+                status = "ok"
+                error_type = None
+                error_message = None
+
+                for qid, qtext in TEST_QUERIES:
+                    res = store.query(spec=spec, chunk_size=chunk_size, question=qtext, k=3)
+                    if res.get("status") != "ok":
+                        status = "failed"
+                        error_type = str(res.get("error_type"))
+                        error_message = str(res.get("error_message"))
+                        break
+                    if load_time is None:
+                        load_time = float(res.get("load_time_sec", 0.0))
+                    index_time = max(index_time, float(res.get("index_time_sec", 0.0)))
+                    timings.append(float(res.get("latency_ms", 0.0)) / 1000.0)
+                    rows = list(res.get("results", []))
+                    query_results[qid] = rows  # type: ignore[assignment]
+                    print_retrieval_sanity_block(
+                        model_label=spec.label,
+                        chunk_size=chunk_size,
+                        question=qtext,
+                        rows=rows,  # type: ignore[arg-type]
+                    )
+
+                if load_time is None:
+                    load_time = 0.0
+                retrieval_avg = sum(timings) / len(timings) if timings else 0.0
+                retrieval_p95 = max(timings) if timings else 0.0
+                docs_count = len(store.docs_cache.get(chunk_size, []))
+                throughput = (docs_count / index_time) if index_time > 0 else 0.0
+                index_size_mb = 0.0
+                key = (spec.model_id, chunk_size)
+                if key in store.vector_cache:
+                    try:
+                        p = Path(store.vector_cache[key].persist_dir)
+                        index_size_mb = sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / (1024 * 1024)
+                    except Exception:
+                        index_size_mb = 0.0
+                metric = CaseMetrics(
+                    model_label=spec.label,
+                    model_id=spec.model_id,
+                    chunk_size=chunk_size,
+                    load_time_sec=load_time,
+                    index_time_sec=index_time,
+                    retrieval_avg_sec=retrieval_avg,
+                    retrieval_p95_sec=retrieval_p95,
+                    vram_peak_mb=None,
+                    index_size_mb=index_size_mb,
+                    embedding_docs_per_sec=throughput,
+                    status=status,
+                    error_type=error_type,
+                    error_message=error_message,
+                    query_results=query_results,  # type: ignore[arg-type]
                 )
                 outer.update(1)
-                first_chunk = False
-
-                if err:
-                    log.error("[%s cs=%s] 실패: %s", spec.label, chunk_size, err)
-                    continue
-                if metric:
-                    all_metrics.append(metric)
+                all_metrics.append(metric)
+                if status == "failed":
+                    log.error("[%s cs=%s] 실패: %s", spec.label, chunk_size, error_message)
+                else:
                     log.info(
                         "[%s chunk=%s] 로드=%s 인덱싱=%.2fs 검색평균=%.4fs VRAM=%s",
                         spec.label,
@@ -157,12 +179,7 @@ def main() -> None:
                         format_vram(metric),
                     )
     finally:
-        for model_id, (_emb, _sec, cleanup, spec) in loaded_models.items():
-            try:
-                cleanup()  # type: ignore[misc]
-                log.info("[언로드 완료] %s (%s)", spec.label, model_id)  # type: ignore[attr-defined]
-            except Exception as e:
-                log.warning("[언로드 실패] %s: %s", model_id, e)
+        store.close()
 
     duration = time.perf_counter() - t_start
 

@@ -70,13 +70,17 @@ def _needs_trust_remote_code(model_id: str) -> bool:
 
 def build_local_embeddings(model_id: str, use_e5_prefix: bool) -> tuple[Embeddings, Callable[[], None]]:
     # VRAM·처리량: CUDA 사용 시 GPU 고정, 배치 16 기본(OOM 시 EMBED_BATCH_SIZE로 하향)
-    model_kwargs: dict[str, Any] = {"device": "cuda" if cuda_available() else "cpu"}
+    force_cpu = {
+        x.strip() for x in os.environ.get("FORCE_CPU_MODELS", "").split(",") if x.strip()
+    }
+    use_cpu = model_id in force_cpu
+    model_kwargs: dict[str, Any] = {"device": "cpu" if use_cpu else ("cuda" if cuda_available() else "cpu")}
     if _needs_trust_remote_code(model_id):
         model_kwargs["trust_remote_code"] = True
 
     encode_kwargs: dict[str, Any] = {
         "normalize_embeddings": True,
-        "batch_size": int(os.environ.get("EMBED_BATCH_SIZE", "16")),
+        "batch_size": int(os.environ.get("EMBED_BATCH_SIZE", "8")),
     }
 
     hf = HuggingFaceEmbeddings(

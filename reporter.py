@@ -42,11 +42,12 @@ def write_report(
     lines.append("정량 자동 채점(Hit@3, MRR)은 제외하고, 검색 문맥 확인 중심으로 기록했습니다.\n\n")
 
     lines.append("## 1) 모델/청크 실행 요약\n\n")
-    lines.append("| 모델 | Chunk | 로드 | 인덱싱 | 검색 평균 | 검색 P95 | VRAM | 인덱스 크기 | 처리량 |\n")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+    lines.append("| 모델 | Chunk | 상태 | 에러 | 로드 | 인덱싱 | 검색 평균 | 검색 P95 | VRAM | 인덱스 크기 | 처리량 |\n")
+    lines.append("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|\n")
     for m in metrics:
+        err = (m.error_message or "").replace("\n", " ").replace("|", "\\|")
         lines.append(
-            f"| {m.model_label} | {m.chunk_size} | {format_load_time(m)} | "
+            f"| {m.model_label} | {m.chunk_size} | {m.status} | {err} | {format_load_time(m)} | "
             f"{m.index_time_sec:.2f}s | {m.retrieval_avg_sec:.4f}s | {m.retrieval_p95_sec:.4f}s | "
             f"{format_vram(m)} | {m.index_size_mb:.2f} MB | {m.embedding_docs_per_sec:.2f} docs/s |\n"
         )
@@ -58,6 +59,9 @@ def write_report(
         for m in metrics:
             rows = m.query_results.get(qid, [])
             lines.append(f"#### {m.model_label} | Chunk {m.chunk_size}\n")
+            if m.status != "ok":
+                lines.append(f"- 실패: `{m.error_type}` - {m.error_message}\n\n")
+                continue
             if not rows:
                 lines.append("- 결과 없음\n\n")
                 continue
