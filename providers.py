@@ -8,8 +8,8 @@ log = logging.getLogger("embeddings")
 
 try:
     import torch
-    from langchain_community.embeddings import HuggingFaceEmbeddings
     from langchain_core.embeddings import Embeddings
+    from langchain_huggingface import HuggingFaceEmbeddings
 except ImportError as e:
     raise SystemExit(
         "필수 패키지가 없습니다. 아래를 설치한 뒤 다시 실행하세요.\n"
@@ -72,7 +72,7 @@ def _needs_trust_remote_code(model_id: str) -> bool:
 
 
 def build_local_embeddings(model_id: str, use_e5_prefix: bool) -> tuple[Embeddings, Callable[[], None]]:
-    # VRAM·처리량: CUDA 사용 시 GPU 고정, 배치 16 기본(OOM 시 EMBED_BATCH_SIZE로 하향)
+    # VRAM·처리량: CUDA 사용 시 GPU 고정; 배치는 환경변수 EMBED_BATCH_SIZE (기본 8, OOM 시 하향)
     force_cpu = {
         x.strip() for x in os.environ.get("FORCE_CPU_MODELS", "").split(",") if x.strip()
     }

@@ -17,10 +17,17 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from config import DOCS_PDF_DIR, MODELS_TO_TEST, REPORTS_ROOT, TEST_QUERIES, CaseMetrics, allowed_chunk_keys
-from evaluator import print_retrieval_sanity_block
+from config import (
+    DEFAULT_CHUNK_KEY,
+    DOCS_PDF_DIR,
+    MODELS_TO_TEST,
+    REPORTS_ROOT,
+    TEST_QUERIES,
+    CaseMetrics,
+)
+from evaluator import percentile, print_chunking_summary, print_retrieval_sanity_block
+from reporter import create_report_output_dir, format_load_time, format_vram, save_visualization_charts, write_report
 from runtime_store import RuntimeStore
-from reporter import create_report_output_dir, format_load_time, format_vram, write_report
 
 
 def setup_logging() -> None:
@@ -98,91 +105,94 @@ def main() -> None:
     hw = store.hardware_note
     log.info("환경: %s", hw)
     log.info("모델 캐시 정책: LRU 최대 %s개", max_cache)
-    log.info("시멘틱 청킹 고정 / 활성 chunk_key: %s", allowed_chunk_keys())
+    log.info("Semantic Chunking E2E / chunk_key=%s", DEFAULT_CHUNK_KEY)
 
-    chunk_keys = allowed_chunk_keys()
-    total_cases = len(MODELS_TO_TEST) * len(chunk_keys)
+    chunk_key = DEFAULT_CHUNK_KEY
+    total_cases = len(MODELS_TO_TEST)
     outer = tqdm(total=total_cases, desc="전체 케이스", unit="case")
 
     try:
         for spec in MODELS_TO_TEST:
-            for chunk_key in chunk_keys:
-                outer.set_postfix(model=spec.label[:24], chunk=str(chunk_key))
-                load_time = None
-                index_time = 0.0
-                timings: list[float] = []
-                query_results: dict[str, list[dict[str, object]]] = {}
-                query_latency_ms: dict[str, float] = {}
-                status = "ok"
-                error_type = None
-                error_message = None
+            outer.set_postfix(model=spec.label[:24])
+            load_time = None
+            index_time = 0.0
+            timings: list[float] = []
+            query_results: dict[str, list[dict[str, object]]] = {}
+            query_latency_ms: dict[str, float] = {}
+            status = "ok"
+            error_type = None
+            error_message = None
 
-                for qid, qtext in TEST_QUERIES:
-                    res = store.query(spec=spec, chunk_key=chunk_key, question=qtext, k=3)
-                    if res.get("status") != "ok":
-                        status = "failed"
-                        error_type = str(res.get("error_type"))
-                        error_message = str(res.get("error_message"))
-                        break
-                    if load_time is None:
-                        load_time = float(res.get("load_time_sec", 0.0))
-                    index_time = max(index_time, float(res.get("index_time_sec", 0.0)))
-                    timings.append(float(res.get("latency_ms", 0.0)) / 1000.0)
-                    query_latency_ms[qid] = float(res.get("latency_ms", 0.0))
-                    rows = list(res.get("results", []))
-                    query_results[qid] = rows  # type: ignore[assignment]
-                    print_retrieval_sanity_block(
-                        model_label=spec.label,
-                        chunk_key=chunk_key,
-                        question=qtext,
-                        rows=rows,  # type: ignore[arg-type]
-                    )
-
+            for qid, qtext in TEST_QUERIES:
+                res = store.query(spec=spec, chunk_key=chunk_key, question=qtext, k=3)
+                if res.get("status") != "ok":
+                    status = "failed"
+                    error_type = str(res.get("error_type"))
+                    error_message = str(res.get("error_message"))
+                    break
                 if load_time is None:
-                    load_time = 0.0
-                retrieval_avg = sum(timings) / len(timings) if timings else 0.0
-                retrieval_p95 = max(timings) if timings else 0.0
-                docs_count = store.count_docs_cached(spec, chunk_key)
-                throughput = (docs_count / index_time) if index_time > 0 else 0.0
-                index_size_mb = 0.0
-                key = (spec.model_id, chunk_key)
-                if key in store.vector_cache:
-                    try:
-                        p = Path(store.vector_cache[key].persist_dir)
-                        index_size_mb = sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / (1024 * 1024)
-                    except Exception:
-                        index_size_mb = 0.0
-                metric = CaseMetrics(
+                    load_time = float(res.get("load_time_sec", 0.0))
+                index_time = max(index_time, float(res.get("index_time_sec", 0.0)))
+                timings.append(float(res.get("latency_ms", 0.0)) / 1000.0)
+                query_latency_ms[qid] = float(res.get("latency_ms", 0.0))
+                rows = list(res.get("results", []))
+                query_results[qid] = rows  # type: ignore[assignment]
+                print_retrieval_sanity_block(
                     model_label=spec.label,
-                    model_id=spec.model_id,
                     chunk_key=chunk_key,
-                    load_time_sec=load_time,
-                    index_time_sec=index_time,
-                    retrieval_avg_sec=retrieval_avg,
-                    retrieval_p95_sec=retrieval_p95,
-                    vram_peak_mb=None,
-                    index_size_mb=index_size_mb,
-                    embedding_docs_per_sec=throughput,
-                    status=status,
-                    error_type=error_type,
-                    error_message=error_message,
-                    query_results=query_results,  # type: ignore[arg-type]
-                    query_latency_ms=query_latency_ms,
+                    question=qtext,
+                    rows=rows,  # type: ignore[arg-type]
                 )
-                outer.update(1)
-                all_metrics.append(metric)
-                if status == "failed":
-                    log.error("[%s ck=%s] 실패: %s", spec.label, chunk_key, error_message)
-                else:
-                    log.info(
-                        "[%s chunk_key=%s] 로드=%s 인덱싱=%.2fs 검색평균=%.4fs VRAM=%s",
-                        spec.label,
-                        chunk_key,
-                        format_load_time(metric),
-                        metric.index_time_sec,
-                        metric.retrieval_avg_sec,
-                        format_vram(metric),
-                    )
+
+            if load_time is None:
+                load_time = 0.0
+            retrieval_avg = sum(timings) / len(timings) if timings else 0.0
+            retrieval_p95 = percentile(timings, 95) if timings else 0.0
+            docs_count = store.count_docs_cached(spec, chunk_key)
+            tc, avg_l, max_l, min_l = store.chunk_length_stats(spec, chunk_key)
+            throughput = (docs_count / index_time) if index_time > 0 else 0.0
+            index_size_mb = 0.0
+            key = (spec.model_id, chunk_key)
+            if key in store.vector_cache:
+                try:
+                    p = Path(store.vector_cache[key].persist_dir)
+                    index_size_mb = sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / (1024 * 1024)
+                except Exception:
+                    index_size_mb = 0.0
+            metric = CaseMetrics(
+                model_label=spec.label,
+                model_id=spec.model_id,
+                load_time_sec=load_time,
+                index_time_sec=index_time,
+                retrieval_avg_sec=retrieval_avg,
+                retrieval_p95_sec=retrieval_p95,
+                vram_peak_mb=None,
+                index_size_mb=index_size_mb,
+                embedding_docs_per_sec=throughput,
+                total_chunks=tc if status == "ok" else 0,
+                avg_chunk_length=avg_l if status == "ok" else 0.0,
+                max_chunk_length=max_l if status == "ok" else 0,
+                min_chunk_length=min_l if status == "ok" else 0,
+                status=status,
+                error_type=error_type,
+                error_message=error_message,
+                query_results=query_results,  # type: ignore[arg-type]
+                query_latency_ms=query_latency_ms,
+            )
+            outer.update(1)
+            all_metrics.append(metric)
+            if status == "failed":
+                log.error("[%s] 실패: %s", spec.label, error_message)
+            else:
+                print_chunking_summary(metric.total_chunks, metric.avg_chunk_length, metric.max_chunk_length)
+                log.info(
+                    "[%s] 로드=%s 인덱싱=%.2fs 검색평균=%.4fs VRAM=%s",
+                    spec.label,
+                    format_load_time(metric),
+                    metric.index_time_sec,
+                    metric.retrieval_avg_sec,
+                    format_vram(metric),
+                )
     finally:
         store.close()
 
@@ -195,8 +205,11 @@ def main() -> None:
         duration_sec=duration,
         output_dir=output_dir,
     )
+    chart_path = save_visualization_charts(all_metrics, output_dir)
     print(f"\n완료. 리포트: {report_path}")
     print(f"산출물 폴더: {output_dir}")
+    if chart_path is not None:
+        print(f"차트: {chart_path}")
 
 
 if __name__ == "__main__":

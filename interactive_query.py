@@ -7,13 +7,9 @@ from pathlib import Path
 import urllib.error
 import urllib.request
 
-from config import allowed_chunk_keys
+from config import DEFAULT_CHUNK_KEY
 
 SERVER_URL = "http://127.0.0.1:8000"
-_default_ck = "p92"
-if _default_ck not in allowed_chunk_keys():
-    _default_ck = allowed_chunk_keys()[0]
-DEFAULT_CHUNK_KEY: str = _default_ck
 DEFAULT_TOP_K = 3
 REPORTS_DIR = Path("reports")
 

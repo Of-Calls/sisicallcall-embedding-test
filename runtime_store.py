@@ -15,10 +15,12 @@ from langchain_core.embeddings import Embeddings
 from config import (
     CHROMA_COSINE_CONFIG,
     ModelSpec,
+    SEMANTIC_BREAKPOINT_PERCENTILE,
+    SEMANTIC_CHUNK_MAX_LENGTH,
+    SEMANTIC_CHUNK_MIN_LENGTH,
     allowed_chunk_keys,
     chunk_folder_segment,
     normalize_chunk_key,
-    semantic_percentile,
 )
 from evaluator import chroma_similarity_from_distance, load_pdf_corpus, split_documents_semantic
 from providers import build_local_embeddings, detect_hardware_note
@@ -51,6 +53,7 @@ class RuntimeStore:
         self.persist_root.mkdir(parents=True, exist_ok=True)
         self.pdf_signature = self._compute_pdf_signature()
         self.docs_cache: dict[tuple[Any, ...], list[Any]] = {}
+        self.chunk_stats_cache: dict[tuple[Any, ...], tuple[int, float, int, int]] = {}
         self.model_cache: OrderedDict[str, LoadedModel] = OrderedDict()
         self.vector_cache: dict[tuple[str, str], VectorStoreEntry] = {}
         self.hardware_note = detect_hardware_note()
@@ -100,7 +103,15 @@ class RuntimeStore:
             return False
         if meta.get("chunk_mode") != "semantic":
             return False
-        return str(meta.get("chunk_key")) == str(chunk_key)
+        if str(meta.get("chunk_key")) != str(chunk_key):
+            return False
+        if float(meta.get("semantic_breakpoint_percentile", -1)) != float(SEMANTIC_BREAKPOINT_PERCENTILE):
+            return False
+        if int(meta.get("semantic_chunk_max_length", -1)) != int(SEMANTIC_CHUNK_MAX_LENGTH):
+            return False
+        if int(meta.get("semantic_chunk_min_length", -1)) != int(SEMANTIC_CHUNK_MIN_LENGTH):
+            return False
+        return True
 
     def is_persist_index_ready(self, model_id: str, chunk_key: str) -> bool:
         """디스크에 유효한 meta + Chroma DB 파일이 있으면 True (재빌드 불필요)."""
@@ -118,7 +129,9 @@ class RuntimeStore:
             "model_id": model_id,
             "chunk_mode": "semantic",
             "chunk_key": chunk_key,
-            "semantic_percentile": semantic_percentile(chunk_key),
+            "semantic_breakpoint_percentile": SEMANTIC_BREAKPOINT_PERCENTILE,
+            "semantic_chunk_max_length": SEMANTIC_CHUNK_MAX_LENGTH,
+            "semantic_chunk_min_length": SEMANTIC_CHUNK_MIN_LENGTH,
             "pdf_signature": self.pdf_signature,
             "updated_at": int(time.time()),
         }
@@ -131,6 +144,10 @@ class RuntimeStore:
         k = self._docs_cache_key(spec, chunk_key)
         d = self.docs_cache.get(k)
         return len(d) if d else 0
+
+    def chunk_length_stats(self, spec: ModelSpec, chunk_key: str) -> tuple[int, float, int, int]:
+        k = self._docs_cache_key(spec, chunk_key)
+        return self.chunk_stats_cache.get(k, (0, 0.0, 0, 0))
 
     def _touch_model(self, model_id: str) -> None:
         if model_id in self.model_cache:
@@ -146,6 +163,10 @@ class RuntimeStore:
             keys = [kk for kk in self.vector_cache if kk[0] == old_model_id]
             for kk in keys:
                 self.vector_cache.pop(kk)
+            doc_keys = [kk for kk in self.docs_cache if kk[0] == old_model_id]
+            for kk in doc_keys:
+                self.docs_cache.pop(kk)
+                self.chunk_stats_cache.pop(kk, None)
 
     def get_or_load_model(self, spec: ModelSpec) -> tuple[LoadedModel | None, float, str | None]:
         if spec.model_id in self.model_cache:
@@ -178,14 +199,18 @@ class RuntimeStore:
         try:
             dk = self._docs_cache_key(spec, chunk_key)
             docs = self.docs_cache.get(dk)
+            stats: tuple[int, float, int, int]
             if docs is None:
-                docs = split_documents_semantic(
-                    self.full_text,
-                    loaded.embedder,
-                    chunk_key,
-                    semantic_percentile(chunk_key),
-                )
+                docs, stats = split_documents_semantic(self.full_text, loaded.embedder)
                 self.docs_cache[dk] = docs
+                self.chunk_stats_cache[dk] = stats
+            else:
+                cached_stats = self.chunk_stats_cache.get(dk)
+                if cached_stats is None:
+                    stats = compute_stats_from_docs(docs)
+                    self.chunk_stats_cache[dk] = stats
+                else:
+                    stats = cached_stats
 
             t0 = time.perf_counter()
             db_dir = self._db_dir(spec.model_id, chunk_key)
@@ -301,7 +326,8 @@ class RuntimeStore:
             "max_models_in_cache": self.max_models_in_cache,
             "loaded_models": list(self.model_cache.keys()),
             "vectorstores": [
-                {"model_id": k[0], "chunk_key": k[1]} for k in sorted(self.vector_cache.keys(), key=lambda x: (x[0], str(x[1])))
+                {"model_id": k[0], "chunk_key": k[1]}
+                for k in sorted(self.vector_cache.keys(), key=lambda x: (x[0], str(x[1])))
             ],
             "persist_root": str(self.persist_root),
         }
@@ -318,3 +344,9 @@ class RuntimeStore:
                 pass
         self.model_cache.clear()
         self.vector_cache.clear()
+
+
+def compute_stats_from_docs(docs: list[Any]) -> tuple[int, float, int, int]:
+    from evaluator import compute_chunk_length_stats
+
+    return compute_chunk_length_stats(docs)

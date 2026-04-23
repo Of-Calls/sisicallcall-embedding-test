@@ -23,7 +23,14 @@ except ImportError as e:
         "  pip install -r requirements.txt"
     ) from e
 
-from config import CHROMA_COSINE_CONFIG, CHUNK_OVERLAP, CaseMetrics, ModelSpec, semantic_percentile
+from config import (
+    CHROMA_COSINE_CONFIG,
+    SEMANTIC_BREAKPOINT_PERCENTILE,
+    SEMANTIC_CHUNK_MAX_LENGTH,
+    CaseMetrics,
+    DEFAULT_CHUNK_KEY,
+    ModelSpec,
+)
 from providers import build_local_embeddings, cuda_available, max_cuda_vram_usage_mb, reset_cuda_stats
 
 SANITY_PREVIEW_MAX_CHARS = 150
@@ -37,6 +44,13 @@ def _compact_preview(text: str, limit: int = SANITY_PREVIEW_MAX_CHARS) -> str:
 def _chunk_label(row: dict[str, float | int | str]) -> str:
     idx = int(row.get("chunk_index", -1))
     return f"chunk_{idx:03d}" if idx >= 0 else "chunk_---"
+
+
+def print_chunking_summary(total: int, avg_len: float, max_len: int) -> None:
+    tqdm.write(
+        f"\n📊 청킹 결과: 총 {total}개 청크 생성 (평균 {avg_len:.1f}자, 최대 {max_len}자)",
+        file=sys.stderr,
+    )
 
 
 def print_retrieval_sanity_block(
@@ -82,35 +96,40 @@ def load_pdf_corpus(directory: Path) -> str:
     return "\n\n".join(parts)
 
 
-def split_documents(text: str, chunk_size: int, overlap: int = CHUNK_OVERLAP) -> list[Document]:
+def compute_chunk_length_stats(docs: list[Document]) -> tuple[int, float, int, int]:
+    if not docs:
+        return 0, 0.0, 0, 0
+    lens = [len(d.page_content) for d in docs]
+    n = len(lens)
+    return n, sum(lens) / n, max(lens), min(lens)
+
+
+def _fallback_split_long_chunks(docs: list[Document], max_len: int) -> list[Document]:
+    """SemanticChunker 결과 중 과도하게 긴 청크만 문자 단위로 재분할."""
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=overlap,
+        chunk_size=max_len,
+        chunk_overlap=0,
         length_function=len,
-        separators=["\n\n", "\n", "。", ". ", " ", ""],
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
-    chunks = splitter.split_text(text)
-    docs: list[Document] = []
-    for i, c in enumerate(chunks):
-        docs.append(
-            Document(
-                page_content=c,
-                metadata={
-                    "chunk_index": i,
-                    "chunk_size": chunk_size,
-                    "chunk_mode": "fixed",
-                },
-            )
-        )
-    return docs
+    out: list[Document] = []
+    for d in docs:
+        if len(d.page_content) <= max_len:
+            out.append(d)
+            continue
+        pieces = splitter.split_text(d.page_content)
+        base_meta = dict(d.metadata)
+        for p in pieces:
+            out.append(Document(page_content=p, metadata=dict(base_meta)))
+    for i, doc in enumerate(out):
+        doc.metadata["chunk_index"] = i
+    return out
 
 
 def split_documents_semantic(
     text: str,
     embedder: Embeddings,
-    profile_id: str,
-    percentile: float,
-) -> list[Document]:
+) -> tuple[list[Document], tuple[int, float, int, int]]:
     try:
         from langchain_experimental.text_splitter import SemanticChunker
     except ImportError as e:
@@ -122,15 +141,16 @@ def split_documents_semantic(
     splitter = SemanticChunker(
         embedder,
         breakpoint_threshold_type="percentile",
-        breakpoint_threshold_amount=percentile,
+        breakpoint_threshold_amount=SEMANTIC_BREAKPOINT_PERCENTILE,
     )
     docs = splitter.create_documents([text])
     for i, d in enumerate(docs):
         d.metadata.setdefault("chunk_index", i)
         d.metadata["chunk_mode"] = "semantic"
-        d.metadata["semantic_profile"] = profile_id
-        d.metadata["semantic_percentile"] = percentile
-    return docs
+        d.metadata["semantic_breakpoint_percentile"] = SEMANTIC_BREAKPOINT_PERCENTILE
+    docs = _fallback_split_long_chunks(docs, SEMANTIC_CHUNK_MAX_LENGTH)
+    stats = compute_chunk_length_stats(docs)
+    return docs, stats
 
 
 def chroma_similarity_from_distance(distance: float) -> float:
@@ -170,7 +190,6 @@ def directory_size_mb(path: str) -> float:
 def run_single_case(
     full_text: str,
     spec: ModelSpec,
-    chunk_key: str,
     queries: list[tuple[str, str]],
     retrieval_warmup: int = 1,
     retrieval_repeats: int = 5,
@@ -194,11 +213,9 @@ def run_single_case(
     elif cuda_available():
         vram_max = max(vram_max, max_cuda_vram_usage_mb())
 
-    documents = split_documents_semantic(
+    documents, (total_chunks, avg_chunk_length, max_chunk_length, min_chunk_length) = split_documents_semantic(
         full_text,
         embedder,
-        chunk_key,
-        semantic_percentile(chunk_key),
     )
 
     persist_dir = tempfile.mkdtemp(prefix="chroma_bench_")
@@ -219,7 +236,7 @@ def run_single_case(
         query_results_raw: dict[str, list[dict[str, float | int | str]]] = {}
 
         total_inner = len(queries) * (retrieval_warmup + retrieval_repeats)
-        with tqdm(total=total_inner, desc=f"{spec.label} ck={chunk_key} retrieval", leave=False) as pbar:
+        with tqdm(total=total_inner, desc=f"{spec.label} retrieval", leave=False) as pbar:
             for _warm_idx in range(retrieval_warmup):
                 for _qkey, qtext in queries:
                     vs.similarity_search_with_score(qtext, k=3)
@@ -245,7 +262,7 @@ def run_single_case(
                         if rows and repeat_idx == retrieval_repeats - 1:
                             print_retrieval_sanity_block(
                                 model_label=spec.label,
-                                chunk_key=chunk_key,
+                                chunk_key=DEFAULT_CHUNK_KEY,
                                 question=qtext,
                                 rows=rows,
                             )
@@ -263,7 +280,6 @@ def run_single_case(
         return CaseMetrics(
             model_label=spec.label,
             model_id=spec.model_id,
-            chunk_key=chunk_key,
             load_time_sec=load_time,
             index_time_sec=index_time,
             retrieval_avg_sec=retrieval_avg,
@@ -271,6 +287,10 @@ def run_single_case(
             vram_peak_mb=vram_max if cuda_available() else None,
             index_size_mb=index_size_mb,
             embedding_docs_per_sec=embedding_docs_per_sec,
+            total_chunks=total_chunks,
+            avg_chunk_length=avg_chunk_length,
+            max_chunk_length=max_chunk_length,
+            min_chunk_length=min_chunk_length,
             query_results=query_results_raw,  # type: ignore[arg-type]
         )
     finally:
@@ -282,7 +302,6 @@ def run_single_case(
 def run_case_safe(
     full_text: str,
     spec: ModelSpec,
-    chunk_key: str,
     queries: list[tuple[str, str]],
     embedder: Embeddings | None = None,
     load_time_override: float | None = None,
@@ -292,7 +311,6 @@ def run_case_safe(
         m = run_single_case(
             full_text,
             spec,
-            chunk_key,
             queries,
             embedder=embedder,
             load_time_override=load_time_override,

@@ -8,6 +8,26 @@ from pathlib import Path
 from config import DOCS_PDF_DIR, MODELS_TO_TEST, allowed_chunk_keys, is_valid_chunk_key
 from runtime_store import RuntimeStore
 
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def load_dotenv_file(dotenv_path: Path | None = None) -> None:
+    """main.py와 동일 규칙: 이미 설정된 환경변수는 덮어쓰지 않음."""
+    import os
+
+    path = dotenv_path or (_PROJECT_ROOT / ".env")
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
 
 def parse_chunk_key_arg(s: str) -> int | str:
     s = str(s).strip()
@@ -17,12 +37,20 @@ def parse_chunk_key_arg(s: str) -> int | str:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="모델별/청크별 ChromaDB 사전 빌드")
-    p.add_argument("--rebuild", action="store_true", help="기존 chroma_db 폴더를 지우고 재생성")
+    p = argparse.ArgumentParser(
+        description="모델별/청크별 ChromaDB 사전 빌드. "
+        "기본: meta+chroma.sqlite3가 유효하면 해당 조합은 건너뜀(미완료·실패만 재시도)."
+    )
+    p.add_argument("--rebuild", action="store_true", help="기존 chroma_db 폴더 전체를 지우고 재생성")
+    p.add_argument(
+        "--no-skip",
+        action="store_true",
+        help="유효한 인덱스가 있어도 선택한 조합은 모두 다시 빌드(시간·VRAM 많이 듦)",
+    )
     p.add_argument(
         "--only-missing",
         action="store_true",
-        help="이미 유효한 인덱스가 있으면 건너뜀 (나머지 모델만 보완 빌드할 때 사용)",
+        help="(호환용, 무시됨) 예전부터 쓰이던 이름. 기본이 이미 '완료 건 스킵'입니다.",
     )
     p.add_argument(
         "--models",
@@ -34,12 +62,13 @@ def parse_args() -> argparse.Namespace:
         "--chunks",
         nargs="*",
         default=[],
-        help="빌드할 chunk_key (시멘틱 프로필: p85 p92 p97). 미지정 시 config 전체",
+        help="빌드할 chunk_key (기본: config.DEFAULT_CHUNK_KEY). 미지정 시 허용 전체",
     )
     return p.parse_args()
 
 
 def main() -> None:
+    load_dotenv_file()
     args = parse_args()
     if args.chunks:
         target_keys = [parse_chunk_key_arg(x) for x in args.chunks]
@@ -63,10 +92,11 @@ def main() -> None:
     store = RuntimeStore(pdf_dir=Path(DOCS_PDF_DIR), max_models_in_cache=1)
     started = time.perf_counter()
     rows: list[dict] = []
+    skip_if_ready = not args.no_skip
     try:
         for spec in selected:
             for ck in target_keys:
-                if args.only_missing and store.is_persist_index_ready(spec.model_id, ck):
+                if skip_if_ready and store.is_persist_index_ready(spec.model_id, ck):
                     rows.append(
                         {
                             "model_id": spec.model_id,
@@ -114,7 +144,7 @@ def main() -> None:
         "# ChromaDB 빌드 리포트\n\n",
         f"- elapsed_sec: {total:.1f}\n",
         "- chunk_mode: semantic (고정)\n",
-        f"- only_missing: {args.only_missing}\n",
+        f"- skip_if_ready: {skip_if_ready} (--no-skip 으로 끔)\n",
         f"- persist_root: `{persist_root}`\n",
         f"- models: {len(selected)}\n",
         f"- chunk_keys: {target_keys}\n\n",

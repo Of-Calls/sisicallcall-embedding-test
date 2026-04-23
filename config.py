@@ -10,33 +10,22 @@ REPORTS_ROOT = SCRIPT_DIR / "reports"
 REPORT_FILENAME = "embedding_benchmark_report.md"
 CHART_FILENAME = "benchmark_visualization.png"
 
-CHUNK_OVERLAP = 50
+# SemanticChunker + 모델별 벡터 공간 기반 분할 (breakpoint_threshold_amount와 동일 스케일)
+SEMANTIC_CHUNK_MIN_LENGTH = 50
+SEMANTIC_CHUNK_MAX_LENGTH = 1000
+SEMANTIC_BREAKPOINT_PERCENTILE = 95.0
 
-# 시멘틱 청킹만 사용 (SemanticChunker, percentile breakpoint).
-# 프로필 ID와 percentile — 같은 질문 세트로 모델·민감도 비교 시 사용.
-SEMANTIC_CHUNK_PROFILES: list[tuple[str, float]] = [
-    ("p85", 85.0),
-    ("p92", 92.0),
-    ("p97", 97.0),
-]
-
-ChunkKey = str
+# 디스크/ API에서 사용하는 단일 청킹 실행 키 (프로필 다중 비교 없음)
+DEFAULT_CHUNK_KEY = "semantic_e2e"
 
 
 def allowed_chunk_keys() -> list[str]:
-    return [pid for pid, _ in SEMANTIC_CHUNK_PROFILES]
+    return [DEFAULT_CHUNK_KEY]
 
 
-def chunk_folder_segment(key: str) -> str:
-    """persist 폴더/컬렉션 접미사용 (예: sem_p92)."""
-    return f"sem_{key}"
-
-
-def semantic_percentile(profile_id: str) -> float:
-    for pid, pct in SEMANTIC_CHUNK_PROFILES:
-        if pid == profile_id:
-            return pct
-    raise KeyError(f"unknown semantic profile: {profile_id}")
+def chunk_folder_segment(_key: str) -> str:
+    """persist 폴더/컬렉션 접미사 (단일 시멘틱 E2E 실행)."""
+    return DEFAULT_CHUNK_KEY
 
 
 def parse_chunk_key(raw: str | int) -> str:
@@ -51,7 +40,8 @@ def normalize_chunk_key(raw: str | int) -> str:
 
 
 def is_valid_chunk_key(key: str | int) -> bool:
-    return normalize_chunk_key(key) in allowed_chunk_keys()
+    return normalize_chunk_key(key) == DEFAULT_CHUNK_KEY
+
 
 # TEST_QUERIES: (질문ID, 질문내용) 형식만 사용합니다.
 TEST_QUERIES: list[tuple[str, str]] = [
@@ -76,7 +66,6 @@ TEST_QUERIES: list[tuple[str, str]] = [
 class CaseMetrics:
     model_label: str
     model_id: str
-    chunk_key: str
     load_time_sec: float | None
     index_time_sec: float
     retrieval_avg_sec: float
@@ -84,6 +73,10 @@ class CaseMetrics:
     vram_peak_mb: float | None
     index_size_mb: float
     embedding_docs_per_sec: float
+    total_chunks: int = 0
+    avg_chunk_length: float = 0.0
+    max_chunk_length: int = 0
+    min_chunk_length: int = 0
     status: str = "ok"
     error_type: str | None = None
     error_message: str | None = None

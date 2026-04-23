@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from config import REPORT_FILENAME, REPORTS_ROOT, CaseMetrics, TEST_QUERIES, allowed_chunk_keys
+from config import CHART_FILENAME, REPORT_FILENAME, REPORTS_ROOT, CaseMetrics, TEST_QUERIES
 
 
 def create_report_output_dir(base_dir: Path = REPORTS_ROOT) -> Path:
@@ -76,6 +76,34 @@ def _domain_hit_for_question(qid: str, rows: list[dict[str, object]]) -> bool | 
     return None
 
 
+def save_visualization_charts(metrics: list[CaseMetrics], output_dir: Path) -> Path | None:
+    ok = [m for m in metrics if m.status == "ok"]
+    if not ok:
+        return None
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = [m.model_label[:18] for m in ok]
+    x = range(len(ok))
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    axes[0].bar(x, [m.retrieval_avg_sec * 1000 for m in ok])
+    axes[0].set_title("검색 평균 레이턴시 (ms)")
+    axes[1].bar(x, [m.total_chunks for m in ok])
+    axes[1].set_title("총 청크 수")
+    axes[2].bar(x, [m.index_time_sec for m in ok])
+    axes[2].set_title("인덱싱 시간 (s)")
+    for ax in axes:
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(labels, rotation=35, ha="right")
+    plt.tight_layout()
+    path = output_dir / CHART_FILENAME
+    plt.savefig(path, dpi=120)
+    plt.close()
+    return path
+
+
 def write_report(
     metrics: list[CaseMetrics],
     hardware_note: str,
@@ -88,22 +116,28 @@ def write_report(
     lines.append(f"- 실행 환경: {hardware_note}\n")
     lines.append(f"- 총 실행 시간: {duration_sec:.1f}s\n")
     lines.append(f"- 케이스 수: {len(metrics)}\n")
-    lines.append(f"- 청킹: 시멘틱 고정 / 활성 chunk_key: `{allowed_chunk_keys()}`\n\n")
+    lines.append("- 청킹: Semantic Chunker (모델별 벡터 공간, percentile breakpoint)\n\n")
     lines.append("정량 자동 채점(Hit@3, MRR)은 제외하고, 검색 문맥 확인 중심으로 기록했습니다.\n\n")
 
     lines.append("## 1) 모델/청크 실행 요약\n\n")
     lines.append(
-        "| 모델 | Chunk | 상태 | 에러 | 로드 | 인덱싱 | Avg Latency | 검색 P95 | Top1-Top2 Gap | Domain Hit@3 | VRAM | 인덱스 크기 | 처리량 |\n"
+        "| 모델 | 청크 개수 | 평균 길이 | 최대 길이 | 최소 길이 | 상태 | 에러 | 로드 | 인덱싱 | Avg Latency | 검색 P95 | Top1-Top2 Gap | Domain Hit@3 | VRAM | 인덱스 크기 | 처리량 |\n"
     )
-    lines.append("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+    lines.append(
+        "|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+    )
     for m in metrics:
         err = (m.error_message or "").replace("\n", " ").replace("|", "\\|")
         gap = _top1_top2_gap(m)
         gap_str = f"{gap:.3f}" if gap is not None else "—"
         hit = _domain_hit_rate_at_3(m)
         hit_str = f"{hit*100:.1f}%" if hit is not None else "—"
+        chunk_n = str(m.total_chunks) if m.status == "ok" else "—"
+        avg_len = f"{m.avg_chunk_length:.1f}" if m.status == "ok" else "—"
+        max_len = str(m.max_chunk_length) if m.status == "ok" else "—"
+        min_len = str(m.min_chunk_length) if m.status == "ok" else "—"
         lines.append(
-            f"| {m.model_label} | {m.chunk_key} | {m.status} | {err} | {format_load_time(m)} | "
+            f"| {m.model_label} | {chunk_n} | {avg_len} | {max_len} | {min_len} | {m.status} | {err} | {format_load_time(m)} | "
             f"{m.index_time_sec:.2f}s | {m.retrieval_avg_sec*1000:.1f}ms | {m.retrieval_p95_sec:.4f}s | "
             f"{gap_str} | {hit_str} | {format_vram(m)} | {m.index_size_mb:.2f} MB | {m.embedding_docs_per_sec:.2f} docs/s |\n"
         )
@@ -112,8 +146,8 @@ def write_report(
     for qid, qtext in TEST_QUERIES:
         lines.append(f"\n### {qid}\n")
         lines.append(f"- 질문: {qtext}\n\n")
-        lines.append("| 모델 | Chunk | 상태 | Top1 sim | Top1-Top2 Gap | Latency | Domain Hit@3 |\n")
-        lines.append("|---|---:|---|---:|---:|---:|---|\n")
+        lines.append("| 모델 | 상태 | Top1 sim | Top1-Top2 Gap | Latency | Domain Hit@3 |\n")
+        lines.append("|---|---|---:|---:|---:|---|\n")
         for m in metrics:
             rows = m.query_results.get(qid, [])
             status = m.status if rows or m.status != "ok" else "no_result"
@@ -126,7 +160,7 @@ def write_report(
             lat = m.query_latency_ms.get(qid)
             hit = _domain_hit_for_question(qid, rows)
             lines.append(
-                f"| {m.model_label} | {m.chunk_key} | {status} | "
+                f"| {m.model_label} | {status} | "
                 f"{(f'{top1:.3f}' if top1 is not None else '—')} | "
                 f"{(f'{gap:.3f}' if gap is not None else '—')} | "
                 f"{(f'{lat:.1f}ms' if lat is not None else '—')} | "
@@ -139,7 +173,7 @@ def write_report(
         lines.append(f"- 질문: {qtext}\n\n")
         for m in metrics:
             rows = m.query_results.get(qid, [])
-            lines.append(f"#### {m.model_label} | Chunk {m.chunk_key}\n")
+            lines.append(f"#### {m.model_label}\n")
             if m.status != "ok":
                 lines.append(f"- 실패: `{m.error_type}` - {m.error_message}\n\n")
                 continue

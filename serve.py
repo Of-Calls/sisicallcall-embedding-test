@@ -12,12 +12,12 @@ from pydantic import BaseModel, Field
 
 from config import (
     CHROMA_COSINE_CONFIG,
+    DEFAULT_CHUNK_KEY,
     DOCS_PDF_DIR,
     MODELS_TO_TEST,
     allowed_chunk_keys,
     chunk_folder_segment,
     is_valid_chunk_key,
-    semantic_percentile,
 )
 from evaluator import chroma_similarity_from_distance, load_pdf_corpus, split_documents_semantic
 from providers import build_local_embeddings
@@ -46,6 +46,7 @@ RUNTIMES: dict[str, ModelRuntime] = {}
 
 
 def _build_runtime(full_text: str) -> None:
+    ck = DEFAULT_CHUNK_KEY
     for spec in MODELS_TO_TEST:
         rt = ModelRuntime(spec.label, spec.model_id, spec.use_e5_prefix)
         t0 = time.perf_counter()
@@ -54,20 +55,19 @@ def _build_runtime(full_text: str) -> None:
         rt.cleanup = cleanup
         rt.load_time_sec = time.perf_counter() - t0
 
-        for ck in allowed_chunk_keys():
-            docs = split_documents_semantic(full_text, rt.embedder, ck, semantic_percentile(ck))
-            persist_dir = tempfile.mkdtemp(prefix=f"serve_{spec.model_id.replace('/', '_')}_")
-            seg = chunk_folder_segment(ck)
+        docs, _stats = split_documents_semantic(full_text, rt.embedder)
+        persist_dir = tempfile.mkdtemp(prefix=f"serve_{spec.model_id.replace('/', '_')}_")
+        seg = chunk_folder_segment(ck)
 
-            vs = Chroma.from_documents(
-                documents=docs,
-                embedding=rt.embedder,
-                collection_name=f"serve_{spec.model_id.replace('/', '_')}_{seg}",
-                persist_directory=persist_dir,
-                collection_configuration=CHROMA_COSINE_CONFIG,
-            )
-            rt.vectorstores[ck] = vs
-            rt.persist_dirs.append(persist_dir)
+        vs = Chroma.from_documents(
+            documents=docs,
+            embedding=rt.embedder,
+            collection_name=f"serve_{spec.model_id.replace('/', '_')}_{seg}",
+            persist_directory=persist_dir,
+            collection_configuration=CHROMA_COSINE_CONFIG,
+        )
+        rt.vectorstores[ck] = vs
+        rt.persist_dirs.append(persist_dir)
         RUNTIMES[spec.model_id] = rt
 
 
