@@ -34,6 +34,7 @@ from config import (
 from providers import build_local_embeddings, cuda_available, max_cuda_vram_usage_mb, reset_cuda_stats
 
 SANITY_PREVIEW_MAX_CHARS = 150
+MIN_CHUNK_LENGTH = 60
 
 
 def _compact_preview(text: str, limit: int = SANITY_PREVIEW_MAX_CHARS) -> str:
@@ -126,6 +127,39 @@ def _fallback_split_long_chunks(docs: list[Document], max_len: int) -> list[Docu
     return out
 
 
+def merge_small_chunks(docs: list[Document], min_length: int = 60) -> list[Document]:
+    if not docs:
+        return []
+
+    merged: list[Document] = []
+    current_text = ""
+    current_metadata: dict[str, object] = {}
+
+    for doc in docs:
+        text = doc.page_content.strip()
+        if not text:
+            continue
+
+        if len(current_text) < min_length:
+            # 현재 누적된 텍스트가 너무 짧으면 다음 청크를 무조건 갖다 붙임
+            current_text = (current_text + " " + text).strip()
+            current_metadata = doc.metadata  # 메타데이터 갱신
+        else:
+            # 충분히 길면 저장하고 새로 시작
+            merged.append(Document(page_content=current_text, metadata=current_metadata))
+            current_text = text
+            current_metadata = doc.metadata
+
+    # 마지막 찌꺼기 처리
+    if current_text:
+        if len(current_text) < min_length and merged:
+            merged[-1].page_content += " " + current_text
+        else:
+            merged.append(Document(page_content=current_text, metadata=current_metadata))
+
+    return merged
+
+
 def split_documents_semantic(
     text: str,
     embedder: Embeddings,
@@ -144,11 +178,14 @@ def split_documents_semantic(
         breakpoint_threshold_amount=SEMANTIC_BREAKPOINT_PERCENTILE,
     )
     docs = splitter.create_documents([text])
+    docs = merge_small_chunks(docs, min_length=MIN_CHUNK_LENGTH)
+    docs = _fallback_split_long_chunks(docs, SEMANTIC_CHUNK_MAX_LENGTH)
+    docs = merge_small_chunks(docs, min_length=MIN_CHUNK_LENGTH)
     for i, d in enumerate(docs):
-        d.metadata.setdefault("chunk_index", i)
+        d.metadata["chunk_index"] = i
         d.metadata["chunk_mode"] = "semantic"
         d.metadata["semantic_breakpoint_percentile"] = SEMANTIC_BREAKPOINT_PERCENTILE
-    docs = _fallback_split_long_chunks(docs, SEMANTIC_CHUNK_MAX_LENGTH)
+        d.metadata["min_chunk_length"] = MIN_CHUNK_LENGTH
     stats = compute_chunk_length_stats(docs)
     return docs, stats
 

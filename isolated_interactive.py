@@ -19,6 +19,7 @@ PDF_DIR = PROJECT_ROOT / "data"
 ISOLATED_DB_ROOT = PROJECT_ROOT / "chroma_db_격리"
 TOP_K = 3
 CHUNK_PREVIEW_COUNT = 40
+MIN_CHUNK_LENGTH = 60
 
 
 def compact_text(text: str, limit: int = 150) -> str:
@@ -33,11 +34,58 @@ def slugify_label(label: str) -> str:
 
 
 def preprocess_pdf_text(text: str) -> str:
-    # Keep paragraph breaks (\n\n or more), but merge physical line wraps.
-    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
-    # Compress redundant spaces while preserving newlines.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Rule A: If a line break follows a non-sentence-ending character,
+    # force-join with a space (applies to both \n and \n\n).
+    text = re.sub(r"(?<![다요까.?!])\s*\n+\s*", " ", text)
+    # Rule B: Compress noisy spaces/newlines into a cleaner form.
     text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
+    text = re.sub(r"\n{2,}", "\n", text)
     return text.strip()
+
+
+def merge_small_chunks(docs: list[object], min_length: int = MIN_CHUNK_LENGTH) -> list[object]:
+    if not docs:
+        return []
+
+    merged: list[object] = []
+    current_doc = None
+    current_text = ""
+
+    for doc in docs:
+        text = str(getattr(doc, "page_content", "")).strip()
+        if not text:
+            continue
+
+        if current_doc is None:
+            current_doc = doc
+            current_text = text
+            continue
+
+        if len(current_text) < min_length:
+            # 누적 텍스트가 짧으면 다음 청크를 강제로 이어 붙인다.
+            current_text = f"{current_text} {text}".strip()
+            setattr(current_doc, "page_content", current_text)
+            continue
+
+        setattr(current_doc, "page_content", current_text)
+        merged.append(current_doc)
+        current_doc = doc
+        current_text = text
+
+    if current_doc is not None:
+        if len(current_text) < min_length and merged:
+            prev = merged[-1]
+            prev_text = str(getattr(prev, "page_content", "")).strip()
+            setattr(prev, "page_content", f"{prev_text} {current_text}".strip())
+        else:
+            setattr(current_doc, "page_content", current_text)
+            merged.append(current_doc)
+
+    for i, doc in enumerate(merged):
+        getattr(doc, "metadata", {})["chunk_index"] = i
+    return merged
 
 
 def print_chunk_preview(docs: list[object], count: int = CHUNK_PREVIEW_COUNT, full_text: bool = False) -> None:
@@ -122,22 +170,26 @@ def build_or_load_vectorstore(spec: ModelSpec, embedder: object, pdf_path: Path)
         for doc in docs:
             doc.page_content = preprocess_pdf_text(doc.page_content)
 
-        chunker = SemanticChunker(
+        text_splitter = SemanticChunker(
             embedder,
+            buffer_size=3,
             breakpoint_threshold_type="percentile",
-            breakpoint_threshold_amount=95.0,
+            breakpoint_threshold_amount=70.0,
         )
-        docs = chunker.split_documents(docs)
-        for i, doc in enumerate(docs):
-            doc.metadata["chunk_index"] = i
+        # 1) 분할
+        chunks = text_splitter.split_documents(docs)
+        # 2) 강제 병합 (반드시 덮어쓰기)
+        chunks = merge_small_chunks(chunks, min_length=MIN_CHUNK_LENGTH)
 
         show_full = input("청크 원문 전체를 잘리지 않게 출력할까요? (y/n): ").strip().lower() == "y"
-        print_chunk_preview(docs, full_text=show_full)
+        # 3) 병합 완료된 최종 chunks로 미리보기 출력
+        print_chunk_preview(chunks, full_text=show_full)
         shutil.rmtree(model_dir, ignore_errors=True)
         model_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n[빌드] PDF: {pdf_path.name} | 페이지 {source_page_count}개, 청크 {len(docs)}개 생성 중...")
+        print(f"\n[빌드] PDF: {pdf_path.name} | 페이지 {source_page_count}개, 청크 {len(chunks)}개 생성 중...")
+        # 4) 병합된 최종 chunks를 DB에 저장
         return Chroma.from_documents(
-            documents=docs,
+            documents=chunks,
             embedding=embedder,
             collection_name=f"isolated_{slugify_label(spec.model_id)}_{slugify_label(pdf_path.stem)}",
             persist_directory=str(model_dir),
@@ -168,8 +220,18 @@ def print_results(spec: ModelSpec, latency_sec: float, scored: list[tuple[object
     print("Top-3 검색 결과:")
     for i, (doc, distance) in enumerate(scored, start=1):
         sim = chroma_similarity_from_distance(float(distance))
-        preview = compact_text(getattr(doc, "page_content", ""))
-        print(f'{i}) [sim={sim:.3f}] "{preview}"')
+        raw_text = str(getattr(doc, "page_content", "")).strip()
+        chunk_idx = getattr(doc, "metadata", {}).get("chunk_index", "?")
+        print(f"{i}) [chunk_index={chunk_idx}] [sim={sim:.3f}]")
+        if raw_text:
+            paragraphs = [p.strip() for p in raw_text.split("\n\n") if p.strip()]
+            for para_idx, para in enumerate(paragraphs, start=1):
+                print(textwrap.fill(para, width=100))
+                if para_idx != len(paragraphs):
+                    print()
+        else:
+            print("(빈 청크)")
+        print("-" * 90)
     print("===============================================")
 
 
