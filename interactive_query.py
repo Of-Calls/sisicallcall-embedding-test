@@ -7,8 +7,13 @@ from pathlib import Path
 import urllib.error
 import urllib.request
 
+from config import allowed_chunk_keys
+
 SERVER_URL = "http://127.0.0.1:8000"
-DEFAULT_CHUNK_SIZE = 600
+_default_ck = "p92"
+if _default_ck not in allowed_chunk_keys():
+    _default_ck = allowed_chunk_keys()[0]
+DEFAULT_CHUNK_KEY: str = _default_ck
 DEFAULT_TOP_K = 3
 REPORTS_DIR = Path("reports")
 
@@ -28,17 +33,17 @@ def post_json(url: str, payload: dict) -> dict:
 def print_result_block(one: dict) -> None:
     status = one.get("status")
     model_id = one.get("model_id", "unknown")
-    chunk_size = one.get("chunk_size", "?")
+    chunk_key = one.get("chunk_key", one.get("chunk_size", "?"))
     if status != "ok":
         print("=" * 72)
-        print(f"[실패] {model_id} | chunk={chunk_size}")
+        print(f"[실패] {model_id} | chunk_key={chunk_key}")
         print(f"- error_type: {one.get('error_type')}")
         print(f"- error_message: {one.get('error_message')}")
         print("=" * 72)
         return
 
     print("=" * 72)
-    print(f"[모델] {model_id} | chunk={chunk_size} | latency={one.get('latency_ms')} ms")
+    print(f"[모델] {model_id} | chunk_key={chunk_key} | latency={one.get('latency_ms')} ms")
     print(f"[질문] {one.get('question')}")
     print("")
     print("Top-k 결과")
@@ -52,7 +57,7 @@ def print_result_block(one: dict) -> None:
     print("=" * 72)
 
 
-def init_markdown_report(chunk_size: int) -> Path:
+def init_markdown_report(chunk_key: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = REPORTS_DIR / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -61,7 +66,7 @@ def init_markdown_report(chunk_size: int) -> Path:
         "# Interactive Query Report\n\n",
         f"- generated_at: {datetime.now().isoformat(timespec='seconds')}\n",
         f"- server_url: {SERVER_URL}\n",
-        f"- chunk_size: {chunk_size}\n",
+        f"- chunk_key: {chunk_key}\n",
         f"- top_k: {DEFAULT_TOP_K}\n\n",
         "---\n\n",
     ]
@@ -74,9 +79,9 @@ def append_markdown_result(md_path: Path, question: str, all_results: list[dict]
     lines.append(f"## 질문: {question}\n\n")
     for one in all_results:
         model_id = one.get("model_id", "unknown")
-        chunk_size = one.get("chunk_size", "?")
+        chunk_key = one.get("chunk_key", one.get("chunk_size", "?"))
         status = one.get("status")
-        lines.append(f"### {model_id} | chunk={chunk_size} | status={status}\n")
+        lines.append(f"### {model_id} | chunk_key={chunk_key} | status={status}\n")
         if status != "ok":
             lines.append(f"- error_type: `{one.get('error_type')}`\n")
             lines.append(f"- error_message: {one.get('error_message')}\n\n")
@@ -97,13 +102,13 @@ def append_markdown_result(md_path: Path, question: str, all_results: list[dict]
 
 
 def main() -> None:
-    chunk_size = DEFAULT_CHUNK_SIZE
+    chunk_key = DEFAULT_CHUNK_KEY
 
     save_md_raw = input("질문/결과를 markdown으로 저장할까요? (y/N): ").strip().lower()
     save_md = save_md_raw == "y"
     md_path: Path | None = None
     if save_md:
-        md_path = init_markdown_report(chunk_size)
+        md_path = init_markdown_report(chunk_key)
         print(f"리포트 저장 경로: {md_path}")
 
     print("질문을 입력하세요. 종료하려면 빈 줄 입력.\n")
@@ -112,7 +117,7 @@ def main() -> None:
         if not question:
             print("종료합니다.")
             break
-        payload = {"question": question, "chunk_size": chunk_size, "k": DEFAULT_TOP_K}
+        payload = {"question": question, "chunk_key": chunk_key, "k": DEFAULT_TOP_K}
         try:
             out = post_json(f"{SERVER_URL}/query_all", payload)
         except urllib.error.URLError as e:

@@ -1,12 +1,16 @@
 langchain
+langchain-huggingface
+langchain-experimental
 langchain-chroma
 langchain-community
 langchain-text-splitters
 chromadb
-sentence-transformers
+sentence-transformers>=3.1.0,<3.2.0
+transformers>=4.44.0,<4.56.0
 pypdf
 cryptography
-torch
+torch --index-url https://download.pytorch.org/whl/cu129
+einops
 tqdm
 matplotlib
 numpy

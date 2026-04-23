@@ -36,3 +36,5 @@ docs/
 .cursor/
 .cursorrules
 *.pdf
+
+data/chroma_db

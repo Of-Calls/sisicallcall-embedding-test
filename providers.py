@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Callable
+
+log = logging.getLogger("embeddings")
 
 try:
     import torch
@@ -74,7 +77,19 @@ def build_local_embeddings(model_id: str, use_e5_prefix: bool) -> tuple[Embeddin
         x.strip() for x in os.environ.get("FORCE_CPU_MODELS", "").split(",") if x.strip()
     }
     use_cpu = model_id in force_cpu
-    model_kwargs: dict[str, Any] = {"device": "cpu" if use_cpu else ("cuda" if cuda_available() else "cpu")}
+    device = "cpu" if use_cpu else ("cuda" if cuda_available() else "cpu")
+    if not use_cpu and not cuda_available():
+        log.warning(
+            "GPU 비활성: torch=%s (CPU 빌드이거나 CUDA 미인식). "
+            "https://pytorch.org/get-started/locally/ 에서 cuda용 torch 설치 후 다시 실행하세요.",
+            torch.__version__,
+        )
+    elif not use_cpu:
+        log.info("임베딩 GPU 사용: %s | model_id=%s", torch.cuda.get_device_name(0), model_id)
+    else:
+        log.info("임베딩 CPU 강제(FORCE_CPU_MODELS): model_id=%s", model_id)
+
+    model_kwargs: dict[str, Any] = {"device": device}
     if _needs_trust_remote_code(model_id):
         model_kwargs["trust_remote_code"] = True
 

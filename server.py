@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from config import CHUNK_SIZES, DOCS_PDF_DIR, MODELS_TO_TEST
+from config import DOCS_PDF_DIR, MODELS_TO_TEST, allowed_chunk_keys
 from runtime_store import RuntimeStore
 
 log = logging.getLogger("embedding_server")
@@ -17,14 +17,14 @@ store: RuntimeStore | None = None
 
 class QueryRequest(BaseModel):
     model_id: str
-    chunk_size: int
+    chunk_key: str
     question: str = Field(..., min_length=1)
     k: int = Field(default=3, ge=1, le=10)
 
 
 class QueryAllRequest(BaseModel):
     question: str = Field(..., min_length=1)
-    chunk_size: int
+    chunk_key: str
     k: int = Field(default=3, ge=1, le=10)
 
 
@@ -36,7 +36,7 @@ def startup() -> None:
     store = RuntimeStore(pdf_dir=DOCS_PDF_DIR, max_models_in_cache=max_models)
     log.info("하드웨어: %s", store.hardware_note)
     log.info("캐시 정책: model LRU size=%s", max_models)
-    log.info("chunk sizes: %s", CHUNK_SIZES)
+    log.info("semantic chunking / allowed_chunk_keys=%s", allowed_chunk_keys())
 
 
 @app.on_event("shutdown")
@@ -64,11 +64,12 @@ def models() -> dict[str, Any]:
         return {"status": "starting", "models": []}
     return {
         "status": "ok",
+        "chunk_mode": "semantic",
+        "chunk_keys": allowed_chunk_keys(),
         "models": [
             {"label": m.label, "model_id": m.model_id, "use_e5_prefix": m.use_e5_prefix}
             for m in MODELS_TO_TEST
         ],
-        "chunk_sizes": CHUNK_SIZES,
         "cache": store.cache_snapshot(),
     }
 
@@ -82,11 +83,11 @@ def query(req: QueryRequest) -> dict[str, Any]:
         return {
             "status": "failed",
             "model_id": req.model_id,
-            "chunk_size": req.chunk_size,
+            "chunk_key": req.chunk_key,
             "error_type": "unknown_model",
             "error_message": "config.MODELS_TO_TEST에 없는 모델입니다.",
         }
-    return store.query(spec=spec, chunk_size=req.chunk_size, question=req.question, k=req.k)
+    return store.query(spec=spec, chunk_key=req.chunk_key, question=req.question, k=req.k)
 
 
 @app.post("/query_all")
@@ -95,11 +96,11 @@ def query_all(req: QueryAllRequest) -> dict[str, Any]:
         return {"status": "failed", "error_type": "server_not_ready", "error_message": "store not ready"}
     outputs: list[dict[str, Any]] = []
     for spec in MODELS_TO_TEST:
-        outputs.append(store.query(spec=spec, chunk_size=req.chunk_size, question=req.question, k=req.k))
+        outputs.append(store.query(spec=spec, chunk_key=req.chunk_key, question=req.question, k=req.k))
     return {
         "status": "ok",
         "question": req.question,
-        "chunk_size": req.chunk_size,
+        "chunk_key": req.chunk_key,
         "k": req.k,
         "results": outputs,
     }

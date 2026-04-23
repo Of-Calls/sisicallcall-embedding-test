@@ -5,13 +5,25 @@ import json
 import time
 from pathlib import Path
 
-from config import CHUNK_SIZES, DOCS_PDF_DIR, MODELS_TO_TEST
+from config import DOCS_PDF_DIR, MODELS_TO_TEST, allowed_chunk_keys, is_valid_chunk_key
 from runtime_store import RuntimeStore
+
+
+def parse_chunk_key_arg(s: str) -> int | str:
+    s = str(s).strip()
+    if s.isdigit():
+        return int(s)
+    return s
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="모델별/청크별 ChromaDB 사전 빌드")
     p.add_argument("--rebuild", action="store_true", help="기존 chroma_db 폴더를 지우고 재생성")
+    p.add_argument(
+        "--only-missing",
+        action="store_true",
+        help="이미 유효한 인덱스가 있으면 건너뜀 (나머지 모델만 보완 빌드할 때 사용)",
+    )
     p.add_argument(
         "--models",
         nargs="*",
@@ -19,21 +31,24 @@ def parse_args() -> argparse.Namespace:
         help="빌드할 model_id 목록 (미지정 시 전체)",
     )
     p.add_argument(
-        "--chunk-sizes",
+        "--chunks",
         nargs="*",
-        type=int,
         default=[],
-        help="빌드할 chunk_size 목록 (미지정 시 config 전체)",
+        help="빌드할 chunk_key (시멘틱 프로필: p85 p92 p97). 미지정 시 config 전체",
     )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    target_chunks = args.chunk_sizes or CHUNK_SIZES
-    invalid_chunks = [c for c in target_chunks if c not in CHUNK_SIZES]
-    if invalid_chunks:
-        raise SystemExit(f"지원하지 않는 chunk_size: {invalid_chunks} / 지원값: {CHUNK_SIZES}")
+    if args.chunks:
+        target_keys = [parse_chunk_key_arg(x) for x in args.chunks]
+    else:
+        target_keys = allowed_chunk_keys()
+
+    invalid = [c for c in target_keys if not is_valid_chunk_key(c)]
+    if invalid:
+        raise SystemExit(f"지원하지 않는 chunk_key: {invalid} / 허용값: {allowed_chunk_keys()}")
 
     selected = [m for m in MODELS_TO_TEST if not args.models or m.model_id in set(args.models)]
     if not selected:
@@ -50,24 +65,39 @@ def main() -> None:
     rows: list[dict] = []
     try:
         for spec in selected:
-            for cs in target_chunks:
+            for ck in target_keys:
+                if args.only_missing and store.is_persist_index_ready(spec.model_id, ck):
+                    rows.append(
+                        {
+                            "model_id": spec.model_id,
+                            "chunk_key": ck,
+                            "status": "skipped",
+                            "elapsed_sec": 0.0,
+                            "collection_name": store.collection_name(spec.model_id, ck),
+                            "db_path": str(store.db_path(spec.model_id, ck)),
+                            "error_message": None,
+                        }
+                    )
+                    print(f"[SKIP] {spec.model_id} chunk_key={ck} (이미 유효한 인덱스)")
+                    continue
+
                 t0 = time.perf_counter()
-                ok, err = store.ensure_built(spec, cs)
+                ok, err = store.ensure_built(spec, ck)
                 elapsed = time.perf_counter() - t0
                 rows.append(
                     {
                         "model_id": spec.model_id,
-                        "chunk_size": cs,
+                        "chunk_key": ck,
                         "status": "ok" if ok else "failed",
                         "elapsed_sec": round(elapsed, 2),
-                        "collection_name": store.collection_name(spec.model_id, cs),
-                        "db_path": str(store.db_path(spec.model_id, cs)),
+                        "collection_name": store.collection_name(spec.model_id, ck),
+                        "db_path": str(store.db_path(spec.model_id, ck)),
                         "error_message": err,
                     }
                 )
                 print(
-                    f"[{'OK' if ok else 'FAIL'}] {spec.model_id} chunk={cs} "
-                    f"({elapsed:.2f}s) -> {store.db_path(spec.model_id, cs)}"
+                    f"[{'OK' if ok else 'FAIL'}] {spec.model_id} chunk_key={ck} "
+                    f"({elapsed:.2f}s) -> {store.db_path(spec.model_id, ck)}"
                 )
                 if err:
                     print(f"  error: {err}")
@@ -83,16 +113,18 @@ def main() -> None:
     lines = [
         "# ChromaDB 빌드 리포트\n\n",
         f"- elapsed_sec: {total:.1f}\n",
+        "- chunk_mode: semantic (고정)\n",
+        f"- only_missing: {args.only_missing}\n",
         f"- persist_root: `{persist_root}`\n",
         f"- models: {len(selected)}\n",
-        f"- chunk_sizes: {target_chunks}\n\n",
-        "| model_id | chunk_size | status | elapsed_sec | collection_name | db_path | error |\n",
+        f"- chunk_keys: {target_keys}\n\n",
+        "| model_id | chunk_key | status | elapsed_sec | collection_name | db_path | error |\n",
         "|---|---:|---|---:|---|---|---|\n",
     ]
     for r in rows:
         err = (r["error_message"] or "").replace("|", "\\|").replace("\n", " ")
         lines.append(
-            f"| {r['model_id']} | {r['chunk_size']} | {r['status']} | {r['elapsed_sec']} | "
+            f"| {r['model_id']} | {r['chunk_key']} | {r['status']} | {r['elapsed_sec']} | "
             f"{r['collection_name']} | {r['db_path']} | {err} |\n"
         )
     md.write_text("".join(lines), encoding="utf-8")
