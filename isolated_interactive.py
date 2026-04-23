@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import time
+import textwrap
 from pathlib import Path
 
 from langchain_chroma import Chroma
@@ -31,14 +32,39 @@ def slugify_label(label: str) -> str:
     return slug or "model"
 
 
+def preprocess_pdf_text(text: str) -> str:
+    # Keep paragraph breaks (\n\n or more), but merge physical line wraps.
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+    # Compress redundant spaces while preserving newlines.
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
 def print_chunk_preview(docs: list[object], count: int = CHUNK_PREVIEW_COUNT, full_text: bool = False) -> None:
     end = min(count, len(docs))
     print(f"\n[청크 미리보기] 초반 {end}개")
+    print("-" * 90)
     for i in range(end):
         doc = docs[i]
-        raw_text = " ".join(str(getattr(doc, "page_content", "")).split())
-        text = raw_text if full_text else compact_text(raw_text, limit=220)
-        print(f"{i + 1:02d}) {text}")
+        raw_text = str(getattr(doc, "page_content", ""))
+        compact = " ".join(raw_text.split())
+        chunk_idx = getattr(doc, "metadata", {}).get("chunk_index", i)
+        print(f"[{i + 1:02d}/{end:02d}] chunk_index={chunk_idx} | chars={len(compact)}")
+
+        if full_text:
+            paragraphs = [p.strip() for p in raw_text.split("\n\n") if p.strip()]
+            if not paragraphs:
+                print("(빈 청크)")
+            else:
+                for para_idx, para in enumerate(paragraphs, start=1):
+                    print(textwrap.fill(para, width=100))
+                    if para_idx != len(paragraphs):
+                        print()
+        else:
+            preview = compact_text(compact, limit=420)
+            print(textwrap.fill(preview, width=100))
+
+        print("-" * 90)
     print("[청크 미리보기 종료]\n")
 
 
@@ -88,16 +114,20 @@ def build_or_load_vectorstore(spec: ModelSpec, embedder: object, pdf_path: Path)
 
     if rebuild == "y":
         loader = PyPDFLoader(str(pdf_path))
-        raw_docs = loader.load()
-        if not raw_docs:
+        docs = loader.load()
+        if not docs:
             raise ValueError(f"선택한 PDF에서 텍스트를 찾지 못했습니다: {pdf_path}")
+
+        source_page_count = len(docs)
+        for doc in docs:
+            doc.page_content = preprocess_pdf_text(doc.page_content)
 
         chunker = SemanticChunker(
             embedder,
             breakpoint_threshold_type="percentile",
             breakpoint_threshold_amount=95.0,
         )
-        docs = chunker.split_documents(raw_docs)
+        docs = chunker.split_documents(docs)
         for i, doc in enumerate(docs):
             doc.metadata["chunk_index"] = i
 
@@ -105,7 +135,7 @@ def build_or_load_vectorstore(spec: ModelSpec, embedder: object, pdf_path: Path)
         print_chunk_preview(docs, full_text=show_full)
         shutil.rmtree(model_dir, ignore_errors=True)
         model_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n[빌드] PDF: {pdf_path.name} | 페이지 {len(raw_docs)}개, 청크 {len(docs)}개 생성 중...")
+        print(f"\n[빌드] PDF: {pdf_path.name} | 페이지 {source_page_count}개, 청크 {len(docs)}개 생성 중...")
         return Chroma.from_documents(
             documents=docs,
             embedding=embedder,
