@@ -39,3 +39,7 @@ docs/
 
 data/chroma_db
 chroma_db_격리
+
+# Chunk / RAG test dumps (local only; not for GitHub)
+debug_output/
+test_outputs/

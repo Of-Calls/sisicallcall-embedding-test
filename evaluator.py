@@ -356,3 +356,128 @@ def run_case_safe(
         return m, None
     except Exception as e:
         return None, str(e)
+
+
+def _infer_domain_relevance(query_id: str, text: str) -> bool:
+    lowered = text.lower()
+    dji_kw = ("dji", "드론", "비행", "기체", "조종기")
+    tesla_kw = ("tesla", "모델", "차량", "트렁크", "충전", "주행")
+    if query_id.startswith("DJI-"):
+        return any(k in lowered for k in dji_kw)
+    if query_id.startswith("TESLA-"):
+        return any(k in lowered for k in tesla_kw)
+    return False
+
+
+def compute_hit_rate_and_mrr(
+    *,
+    queries: list[tuple[str, str]],
+    query_results_raw: dict[str, list[dict[str, float | int | str]]],
+    k: int = 3,
+) -> tuple[float, float]:
+    hits = 0
+    reciprocal_ranks: list[float] = []
+    for qid, _qtext in queries:
+        rows = query_results_raw.get(qid, [])
+        found_rank = 0
+        for rank, row in enumerate(rows[:k], start=1):
+            text = str(row.get("text", ""))
+            if _infer_domain_relevance(qid, text):
+                found_rank = rank
+                break
+        if found_rank > 0:
+            hits += 1
+            reciprocal_ranks.append(1.0 / found_rank)
+        else:
+            reciprocal_ranks.append(0.0)
+    total = len(queries)
+    if total == 0:
+        return 0.0, 0.0
+    return hits / total, sum(reciprocal_ranks) / total
+
+
+def evaluate_chunked_documents(
+    *,
+    documents: list[Document],
+    spec: ModelSpec,
+    queries: list[tuple[str, str]],
+    parser_name: str,
+    retrieval_warmup: int = 1,
+    retrieval_repeats: int = 5,
+    k: int = 3,
+) -> tuple[CaseMetrics, float, float]:
+    collection_name = f"bench_{parser_name}_{uuid.uuid4().hex}"
+    reset_cuda_stats()
+    t0 = time.perf_counter()
+    embedder, cleanup = build_local_embeddings(spec.model_id, spec.use_e5_prefix)
+    load_time = time.perf_counter() - t0
+    vram_max = max_cuda_vram_usage_mb() if cuda_available() else 0.0
+
+    total_chunks, avg_chunk_length, max_chunk_length, min_chunk_length = compute_chunk_length_stats(documents)
+
+    persist_dir = tempfile.mkdtemp(prefix=f"chroma_{parser_name}_")
+    index_t0 = time.perf_counter()
+    try:
+        vs = Chroma.from_documents(
+            documents=documents,
+            embedding=embedder,
+            collection_name=collection_name,
+            persist_directory=persist_dir,
+            collection_configuration=CHROMA_COSINE_CONFIG,
+        )
+        index_time = time.perf_counter() - index_t0
+
+        timings: list[float] = []
+        query_results_raw: dict[str, list[dict[str, float | int | str]]] = {}
+        total_inner = len(queries) * (retrieval_warmup + retrieval_repeats)
+        with tqdm(total=total_inner, desc=f"{parser_name} retrieval", leave=False) as pbar:
+            for _ in range(retrieval_warmup):
+                for _qkey, qtext in queries:
+                    vs.similarity_search_with_score(qtext, k=k)
+                    pbar.update(1)
+            for repeat_idx in range(retrieval_repeats):
+                for qkey, qtext in queries:
+                    tq = time.perf_counter()
+                    scored = vs.similarity_search_with_score(qtext, k=k)
+                    timings.append(time.perf_counter() - tq)
+                    if repeat_idx == retrieval_repeats - 1:
+                        rows = []
+                        for rank, (doc, dist) in enumerate(scored, start=1):
+                            rows.append(
+                                {
+                                    "rank": rank,
+                                    "chroma_distance": dist,
+                                    "cosine_similarity": chroma_similarity_from_distance(dist),
+                                    "text": doc.page_content,
+                                    "chunk_index": doc.metadata.get("chunk_index", -1),
+                                }
+                            )
+                        query_results_raw[qkey] = rows
+                    pbar.update(1)
+
+        retrieval_avg = sum(timings) / len(timings) if timings else 0.0
+        retrieval_p95 = percentile(timings, 95)
+        index_size_mb = directory_size_mb(persist_dir)
+        embedding_docs_per_sec = (len(documents) / index_time) if index_time > 0 else 0.0
+        hit_rate, mrr = compute_hit_rate_and_mrr(queries=queries, query_results_raw=query_results_raw, k=k)
+
+        metric = CaseMetrics(
+            model_label=f"{spec.label} | {parser_name}",
+            model_id=spec.model_id,
+            load_time_sec=load_time,
+            index_time_sec=index_time,
+            retrieval_avg_sec=retrieval_avg,
+            retrieval_p95_sec=retrieval_p95,
+            vram_peak_mb=vram_max if cuda_available() else None,
+            index_size_mb=index_size_mb,
+            embedding_docs_per_sec=embedding_docs_per_sec,
+            total_chunks=total_chunks,
+            avg_chunk_length=avg_chunk_length,
+            max_chunk_length=max_chunk_length,
+            min_chunk_length=min_chunk_length,
+            query_results=query_results_raw,  # type: ignore[arg-type]
+        )
+        return metric, hit_rate, mrr
+    finally:
+        shutil.rmtree(persist_dir, ignore_errors=True)
+        cleanup()
